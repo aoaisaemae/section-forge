@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Box, Download, Grid3X3, ScanLine, Sparkles, XCircle } from "lucide-react";
+import { Box, Download, Grid3X3, Hand, Layers3, MousePointer2, Redo2, RotateCcw, Route, ScanLine, Sparkles, Undo2, XCircle } from "lucide-react";
 
 type StoredImage={key:string;name:string;size:number;uploadedAt:string};
 const source=(key:string)=>`/api/images/content?key=${encodeURIComponent(key)}`;
@@ -383,63 +383,96 @@ function contourFidelity(points:Point2[],fidelity:number){
   if(closed)result.push(result[0]);return result;
 }
 
+function keepLargestConnectedField(field:Float32Array,threshold=.32){
+  const visited=new Uint8Array(W*H),components:number[][]=[];
+  for(let start=0;start<field.length;start++){
+    if(visited[start]||field[start]<threshold)continue;
+    const component:number[]=[],queue=[start];visited[start]=1;
+    for(let cursor=0;cursor<queue.length;cursor++){
+      const index=queue[cursor],x=index%W,y=Math.floor(index/W);component.push(index);
+      const neighbors=[x>0?index-1:-1,x<W-1?index+1:-1,y>0?index-W:-1,y<H-1?index+W:-1];
+      for(const next of neighbors)if(next>=0&&!visited[next]&&field[next]>=threshold){visited[next]=1;queue.push(next)}
+    }
+    components.push(component);
+  }
+  const largest=components.sort((a,b)=>b.length-a.length)[0]??[],result=new Float32Array(field.length);
+  for(const index of largest)result[index]=field[index];
+  return result;
+}
+
 type ArchitecturalAnchor={point:Point2;role:string};
 function architecturalAnchors(section:Point2[][],targetCount:number){
   const ranked=[...section].sort((a,b)=>loopArea(b)-loopArea(a)),outer=ranked[0];
   if(!outer)return[] as ArchitecturalAnchor[];
-  const source=outer.length>1&&outer[0][0]===outer.at(-1)![0]&&outer[0][1]===outer.at(-1)![1]?outer.slice(0,-1):outer;
+  let source=outer.length>1&&outer[0][0]===outer.at(-1)![0]&&outer[0][1]===outer.at(-1)![1]?outer.slice(0,-1):outer;
   if(source.length<3)return[] as ArchitecturalAnchor[];
-  const centroid:Point2=[source.reduce((sum,p)=>sum+p[0],0)/source.length,source.reduce((sum,p)=>sum+p[1],0)/source.length];
-  const extreme=(score:(point:Point2)=>number)=>source.reduce((best,point)=>score(point)>score(best)?point:best,source[0]);
-  const maxY=Math.max(...source.map(point=>point[1])),minY=Math.min(...source.map(point=>point[1])),height=Math.max(1,maxY-minY);
-  const groundBand=source.filter(point=>point[1]>=maxY-height*.13),leftGround=groundBand.filter(point=>point[0]<=centroid[0]),rightGround=groundBand.filter(point=>point[0]>=centroid[0]);
-  const anchors:ArchitecturalAnchor[]=[
-    {role:"ridge",point:extreme(point=>-point[1])},
-    {role:"left_extent",point:extreme(point=>-point[0])},
-    {role:"right_extent",point:extreme(point=>point[0])},
-    {role:"ground_left",point:(leftGround.length?leftGround:groundBand).reduce((best,point)=>point[0]<best[0]?point:best,(leftGround[0]??groundBand[0]??source[0]))},
-    {role:"ground_right",point:(rightGround.length?rightGround:groundBand).reduce((best,point)=>point[0]>best[0]?point:best,(rightGround[0]??groundBand[0]??source[0]))}
-  ];
-  // The largest interior loop is treated as the principal occupiable void.
-  // Its crown, lateral edges and two low threshold points receive priority.
-  const voidLoop=ranked[1];
-  if(voidLoop){
-    const cavity=voidLoop.length>1&&voidLoop[0][0]===voidLoop.at(-1)![0]&&voidLoop[0][1]===voidLoop.at(-1)![1]?voidLoop.slice(0,-1):voidLoop;
-    const voidExtreme=(score:(point:Point2)=>number)=>cavity.reduce((best,point)=>score(point)>score(best)?point:best,cavity[0]);
-    const voidMaxY=Math.max(...cavity.map(point=>point[1])),voidHeight=Math.max(1,voidMaxY-Math.min(...cavity.map(point=>point[1]))),threshold=cavity.filter(point=>point[1]>=voidMaxY-voidHeight*.18).sort((a,b)=>a[0]-b[0]);
-    anchors.push(
-      {role:"void_crown",point:voidExtreme(point=>-point[1])},
-      {role:"void_left",point:voidExtreme(point=>-point[0])},
-      {role:"void_right",point:voidExtreme(point=>point[0])},
-      {role:"threshold_left",point:threshold[0]??voidExtreme(point=>point[1])},
-      {role:"threshold_right",point:threshold.at(-1)??voidExtreme(point=>point[1])}
-    );
-  }
-  // Remaining capacity goes to the strongest directional changes. Curvature
-  // peaks behave as shoulders, valleys and structural turning points.
-  const curvature=source.map((point,index)=>{
-    const before=source[(index-2+source.length)%source.length],after=source[(index+2)%source.length];
-    const a=Math.atan2(point[1]-before[1],point[0]-before[0]),b=Math.atan2(after[1]-point[1],after[0]-point[0]);
-    return{point,score:Math.abs(Math.atan2(Math.sin(b-a),Math.cos(b-a)))};
-  }).sort((a,b)=>b.score-a.score);
-  // Select strong turns first, then name them left-to-right. The spatial order
-  // is deliberately stable: inflection_0 is always the leftmost row,
-  // inflection_1 the next row, and so on. This prevents curvature points from
-  // swapping identities between sections and producing scattered connections.
-  const remaining=Math.max(0,targetCount-anchors.length),turns:{point:Point2;score:number}[]=[];
-  for(const candidate of curvature){
-    if(turns.length>=remaining)break;
-    if(anchors.every(anchor=>pointDistance(anchor.point,candidate.point)>2.4)&&turns.every(turn=>pointDistance(turn.point,candidate.point)>2.4))turns.push(candidate);
-  }
-  turns.sort((a,b)=>a.point[0]-b.point[0]).forEach((turn,index)=>anchors.push({role:`inflection_${index}`,point:turn.point}));
-  return anchors.slice(0,targetCount);
+  // Every section uses one identical point system: clockwise arc-length
+  // stations around the dominant perimeter. The start station is always the
+  // uppermost point, so row_00 in every section describes the same place in
+  // the perimeter sequence instead of a different architectural category.
+  const signed=source.reduce((area,point,index)=>{const next=source[(index+1)%source.length];return area+point[0]*next[1]-next[0]*point[1]},0);
+  if(signed<0)source=[...source].reverse();
+  const start=source.reduce((best,point,index)=>point[1]<source[best][1]||(point[1]===source[best][1]&&point[0]<source[best][0])?index:best,0);
+  source=[...source.slice(start),...source.slice(0,start)];
+  const closed=[...source,source[0]],lengths=[0];for(let index=1;index<closed.length;index++)lengths.push(lengths[index-1]+pointDistance(closed[index-1],closed[index]));
+  const total=lengths.at(-1)??1;
+  return Array.from({length:targetCount},(_,row)=>{const distance=total*row/targetCount;let segment=1;while(segment<lengths.length-1&&lengths[segment]<distance)segment++;const a=closed[segment-1],b=closed[segment],span=Math.max(.0001,lengths[segment]-lengths[segment-1]),t=(distance-lengths[segment-1])/span;return{role:`row_${String(row).padStart(2,"0")}`,point:[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t] as Point2}});
 }
 
 type RuledStrip={a:Vec[];b:Vec[];kind:"outer"|"void"};
-type LongitudinalFamily={primary:Vec[][];primaryRoles:string[];offset:Vec[][];tweens:Vec[][];branches:Vec[][];ruled:RuledStrip[];anchors:{point:Vec;role:string}[]};
-function longitudinalFamilies(slices:Slice[],loops:Point2[][][],pointCount:number,offsetAmount:number,tweenCount:number,bifurcation:number):LongitudinalFamily{
-  const sampled=loops.map((section,index)=>new Map(architecturalAnchors(section,pointCount).map(anchor=>[anchor.role,[(anchor.point[0]/(W-1)-.5)*2.25,(.5-anchor.point[1]/(H-1))*1.7,slices[index].z] as Vec])));
-  const roles=["ridge","left_extent","right_extent","ground_left","ground_right","void_crown","void_left","void_right","threshold_left","threshold_right",...Array.from({length:pointCount},(_,index)=>`inflection_${index}`)];
+type PointOffsets=Record<string,Vec>;
+type LongitudinalFamily={primary:Vec[][];primaryRoles:string[];offset:Vec[][];tweens:Vec[][];branches:Vec[][];branchPlates:RuledStrip[];ruled:RuledStrip[];anchors:{point:Vec;role:string}[]};
+type CirculationSettings={primaryCount:number;pathWidth:number;activeBranches:number;junctionWidth:number;smoothing:number};
+type FloorPlateSettings={noiseReduction:number;plateThickness:number;surfaceFlow:number};
+type CirculationRibbon={center:Vec[];left:Vec[];right:Vec[];kind:"spine"|"branch"};
+type CirculationGeometry={ribbons:CirculationRibbon[];floorY:number;topY:number;trimmedCount:number};
+type SpatialPlate={profiles:Vec[][][];cellCount:number};
+const CHUNK_HALF=1.05;
+
+function smoothSpatialRoute(line:Vec[],amount:number){
+  let result=line.filter((point,index)=>index===0||Math.hypot(point[0]-line[index-1][0],point[1]-line[index-1][1],point[2]-line[index-1][2])>.025);
+  const passes=Math.round(Math.max(0,Math.min(100,amount))/20),weight=.34;
+  for(let pass=0;pass<passes;pass++)result=result.map((point,index)=>index===0||index===result.length-1?point:[point[0]*(1-weight)+(result[index-1][0]+result[index+1][0])*.5*weight,point[1]*(1-weight)+(result[index-1][1]+result[index+1][1])*.5*weight,point[2]*(1-weight)+(result[index-1][2]+result[index+1][2])*.5*weight] as Vec);
+  return result;
+}
+
+function buildCirculationGeometry(families:LongitudinalFamily,settings:CirculationSettings,heightInches:number,bifurcationsPerPrimary:number):CirculationGeometry{
+  const floorY=-CHUNK_HALF+.08,heightFeet=heightInches/12,topY=Math.min(CHUNK_HALF,floorY+heightFeet/20*(CHUNK_HALF*2));
+  if(!families.primary.length)return{ribbons:[],floorY,topY,trimmedCount:0};
+  const selectedCount=Math.max(1,Math.min(families.primary.length,settings.primaryCount));
+  const selectedIndices=Array.from({length:selectedCount},(_,index)=>selectedCount===1?0:Math.round(index*(families.primary.length-1)/(selectedCount-1)));
+  const sources:[Vec[],"spine"|"branch"][]=[];
+  selectedIndices.forEach(primaryIndex=>{
+    sources.push([families.primary[primaryIndex],"spine"]);
+    const branchStart=primaryIndex*Math.max(0,bifurcationsPerPrimary);
+    families.branches.slice(branchStart,branchStart+Math.max(0,settings.activeBranches)).forEach(line=>sources.push([line,"branch"]));
+  });
+  let trimmedCount=0;
+  const ribbons=sources.map(([source,kind])=>{
+    const spatial=source.map(([x,y,z])=>{if(Math.abs(x)>CHUNK_HALF||Math.abs(z)>CHUNK_HALF||y<-.85||y>.85)trimmedCount++;const vertical=(Math.max(-.85,Math.min(.85,y))+.85)/1.7;return[Math.max(-CHUNK_HALF,Math.min(CHUNK_HALF,x)),floorY+vertical*(topY-floorY),Math.max(-CHUNK_HALF,Math.min(CHUNK_HALF,z))] as Vec});
+    const center=smoothSpatialRoute(spatial,settings.smoothing),baseHalf=Math.max(.12,settings.pathWidth/20*CHUNK_HALF);
+    const left:Vec[]=[],right:Vec[]=[];
+    center.forEach((point,index)=>{const before=center[Math.max(0,index-1)],after=center[Math.min(center.length-1,index+1)],tx=after[0]-before[0],tz=after[2]-before[2],length=Math.hypot(tx,tz),nx=length>.0001?-tz/length:1,nz=length>.0001?tx/length:0,progress=index/Math.max(1,center.length-1),junction=Math.pow(Math.sin(Math.PI*progress),2),widen=1+settings.junctionWidth/100*(kind==="branch"?.55:.32)*junction,half=baseHalf*widen;left.push([Math.max(-CHUNK_HALF,Math.min(CHUNK_HALF,point[0]+nx*half)),point[1],Math.max(-CHUNK_HALF,Math.min(CHUNK_HALF,point[2]+nz*half))]);right.push([Math.max(-CHUNK_HALF,Math.min(CHUNK_HALF,point[0]-nx*half)),point[1],Math.max(-CHUNK_HALF,Math.min(CHUNK_HALF,point[2]-nz*half))])});
+    return{center,left,right,kind};
+  }).filter(ribbon=>ribbon.center.length>1);
+  return{ribbons,floorY,topY,trimmedCount};
+}
+
+function buildUnifiedFloorPlate(circulation:CirculationGeometry,settings:FloorPlateSettings):SpatialPlate{
+  const sample=(line:Vec[],count:number)=>Array.from({length:count},(_,index)=>{const position=index/Math.max(1,count-1)*Math.max(0,line.length-1),a=Math.floor(position),b=Math.min(line.length-1,a+1),t=position-a;return[line[a][0]+(line[b][0]-line[a][0])*t,line[a][1]+(line[b][1]-line[a][1])*t,line[a][2]+(line[b][2]-line[a][2])*t] as Vec});
+  const rails=circulation.ribbons.map(ribbon=>smoothSpatialRoute(ribbon.center,settings.noiseReduction)).filter(line=>line.length>1),spaceExpansion=Math.max(0,Math.min(100,settings.surfaceFlow))/100;
+  const pairs=rails.length>1?rails.slice(0,-1).map((rail,index)=>[rail,rails[index+1]] as [Vec[],Vec[]]):circulation.ribbons.slice(0,1).map(ribbon=>[smoothSpatialRoute(ribbon.left,settings.noiseReduction),smoothSpatialRoute(ribbon.right,settings.noiseReduction)] as [Vec[],Vec[]]);
+  const profiles=pairs.map(([railA,railB])=>{
+    const count=Math.max(2,Math.max(railA.length,railB.length)),a=sample(railA,count),b=sample(railB,count);
+    return Array.from({length:count},(_,index)=>{const progress=index/Math.max(1,count-1),node=Math.pow(Math.sin(Math.PI*progress),4),expansion=1+spaceExpansion*(.08+node*.35),mid:[number,number,number]=[(a[index][0]+b[index][0])/2,(a[index][1]+b[index][1])/2,(a[index][2]+b[index][2])/2],expand=(point:Vec):Vec=>[Math.max(-CHUNK_HALF,Math.min(CHUNK_HALF,mid[0]+(point[0]-mid[0])*expansion)),Math.max(circulation.floorY,Math.min(circulation.topY,point[1])),Math.max(-CHUNK_HALF,Math.min(CHUNK_HALF,mid[2]+(point[2]-mid[2])*expansion))];return[expand(a[index]),expand(b[index])]});
+  });
+  const cellCount=profiles.reduce((sum,route)=>sum+Math.max(0,route.length-1)*Math.max(0,(route[0]?.length??1)-1),0);
+  return{profiles,cellCount};
+}
+
+function longitudinalFamilies(slices:Slice[],loops:Point2[][][],primaryCount:number,smoothing:number,offsetsPerPrimary:number,bifurcationsPerPrimary:number,bifurcationDistance:number,bifurcationScale:number,branchDirections:number[],pointOffsets:PointOffsets):LongitudinalFamily{
+  const sampled=loops.map((section,index)=>new Map(architecturalAnchors(section,primaryCount).map(anchor=>[anchor.role,[(anchor.point[0]/(W-1)-.5)*2.25,(.5-anchor.point[1]/(H-1))*1.7,slices[index].z] as Vec])));
+  const roles=Array.from({length:primaryCount},(_,index)=>`row_${String(index).padStart(2,"0")}`);
   const minimumRowLength=Math.max(2,Math.ceil(slices.length*.6));
   const entries=roles.map(role=>({role,line:sampled.map(section=>section.get(role)).filter(Boolean) as Vec[]})).filter(entry=>entry.line.length>=minimumRowLength).map(entry=>({
     ...entry,
@@ -448,42 +481,41 @@ function longitudinalFamilies(slices:Slice[],loops:Point2[][][],pointCount:numbe
     line:entry.line.map((point,index,line)=>{
       if(index===0||index===line.length-1)return point;
       const before=line[index-1],after=line[index+1];
-      return[point[0]*.5+(before[0]+after[0])*.25,point[1]*.5+(before[1]+after[1])*.25,point[2]] as Vec;
+      const fair=Math.max(0,Math.min(.48,smoothing/100*.48));return[point[0]*(1-fair)+(before[0]+after[0])*.5*fair,point[1]*(1-fair)+(before[1]+after[1])*.5*fair,point[2]] as Vec;
     })
   }));
-  const primary=entries.map(entry=>entry.line),primaryRoles=entries.map(entry=>entry.role);
-  // Build ruled strips only between neighboring, consistently ordered rows.
-  // Rows are paired by shared section depth so a strip can never jump to an
-  // unrelated point or bridge across a missing void boundary.
+  const primary=entries.map(entry=>entry.line),primaryRoles=entries.map(entry=>entry.role),offset:Vec[][]=[],ordered:Vec[][]=[];
+  // Each primary line owns an identical number of interpolated offset lines
+  // toward the next primary. They all inherit the same section depths, so the
+  // hierarchy remains one ordered perimeter system rather than separate cages.
+  for(let index=0;index<entries.length;index++){
+    const left=entries[index].line,right=entries[(index+1)%entries.length].line,rightByDepth=new Map(right.map(point=>[point[2].toFixed(6),point]));ordered.push(left);
+    for(let offsetIndex=1;offsetIndex<=offsetsPerPrimary;offsetIndex++){
+      const t=offsetIndex/(offsetsPerPrimary+1),line=left.map(point=>{const match=rightByDepth.get(point[2].toFixed(6));return match?[point[0]+(match[0]-point[0])*t,point[1]+(match[1]-point[1])*t,point[2]] as Vec:null}).filter((point):point is Vec=>Boolean(point));
+      if(line.length>=minimumRowLength){offset.push(line);ordered.push(line)}
+    }
+  }
   const ruled:RuledStrip[]=[];
-  const rowKind=(role:string):"outer"|"void"=>role.startsWith("void")||role.startsWith("threshold")?"void":"outer";
-  for(const kind of ["outer","void"] as const){
-    const ordered=entries.filter(entry=>rowKind(entry.role)===kind).sort((a,b)=>a.line.reduce((sum,p)=>sum+p[0],0)/a.line.length-b.line.reduce((sum,p)=>sum+p[0],0)/b.line.length);
-    for(let index=0;index<ordered.length-1;index++){
-      const left=ordered[index],right=ordered[index+1],rightByDepth=new Map(right.line.map(point=>[point[2].toFixed(6),point]));
-      const pairs=left.line.map(point=>[point,rightByDepth.get(point[2].toFixed(6))] as const).filter((pair):pair is readonly[Vec,Vec]=>Boolean(pair[1]));
-      if(pairs.length<minimumRowLength)continue;
-      const averageGap=pairs.reduce((sum,[a,b])=>sum+Math.hypot(a[0]-b[0],a[1]-b[1]),0)/pairs.length;
-      if(averageGap<=.82)ruled.push({a:pairs.map(pair=>pair[0]),b:pairs.map(pair=>pair[1]),kind});
-    }
+  for(let index=0;index<ordered.length;index++){
+      const left=ordered[index],right=ordered[(index+1)%ordered.length],rightByDepth=new Map(right.map(point=>[point[2].toFixed(6),point]));
+      const pairs=left.map(point=>[point,rightByDepth.get(point[2].toFixed(6))] as const).filter((pair):pair is readonly[Vec,Vec]=>Boolean(pair[1]));
+      if(pairs.length>=minimumRowLength)ruled.push({a:pairs.map(pair=>pair[0]),b:pairs.map(pair=>pair[1]),kind:"outer"});
   }
-  const delta=.04+offsetAmount/100*.18;
-  const offset=primary.map((line,lineIndex)=>line.map(([x,y,z])=>{const sign=lineIndex%2?1:-1;return[x,y+sign*delta,z] as Vec}));
-  const tweens:Vec[][]=[];
-  for(let line=0;line<primary.length;line++){
-    const next=primary[(line+1)%primary.length];
-    for(let step=1;step<=tweenCount;step++){
-      const t=step/(tweenCount+1);tweens.push(primary[line].map((point,index)=>{
-        const other=next[Math.min(index,next.length-1)]??point;return[point[0]*(1-t)+other[0]*t,point[1]*(1-t)+other[1]*t,point[2]*(1-t)+other[2]*t] as Vec;
-      }));
+  const branches:Vec[][]=[],branchPlates:RuledStrip[]=[];
+  entries.forEach((entry,primaryIndex)=>{
+    for(let branchIndex=0;branchIndex<bifurcationsPerPrimary;branchIndex++){
+      const branchId=primaryIndex*bifurcationsPerPrimary+branchIndex,steering=(branchDirections[branchId]??0)*Math.PI/180,cs=Math.cos(steering),sn=Math.sin(steering);
+      // Every branch in a family follows the same neighboring rail. It leaves
+      // and rejoins its primary at the ends, while the scale exponent makes
+      // successive branches fan outward with increasingly larger gaps.
+      const target=entries[(primaryIndex+1)%entries.length],targetByDepth=new Map(target.line.map(point=>[point[2].toFixed(6),point]));
+      const distanceFactor=Math.max(.05,Math.min(1,bifurcationDistance/100)),scaleExponent=1+Math.max(0,Math.min(100,bifurcationScale))/50;
+      const level=Math.pow((branchIndex+1)/Math.max(1,bifurcationsPerPrimary),scaleExponent),reach=Math.min(.95,distanceFactor*(.28+level*.72));
+      const branch=entry.line.map((point,index,line)=>{const match=targetByDepth.get(point[2].toFixed(6));if(!match)return point;const progress=index/Math.max(1,line.length-1),envelope=Math.pow(Math.sin(Math.PI*progress),1.2),spread=envelope*reach,dx=match[0]-point[0],dy=match[1]-point[1],rx=dx*cs-dy*sn,ry=dx*sn+dy*cs,offset=pointOffsets[`${branchId}:${index}`]??[0,0,0];return[point[0]+rx*spread+offset[0],point[1]+ry*spread+offset[1],point[2]+offset[2]] as Vec});
+      if(branch.length>=minimumRowLength){branches.push(branch);branchPlates.push({a:entry.line,b:branch,kind:"outer"})}
     }
-  }
-  const branches:Vec[][]=[];
-  if(bifurcation>0)primary.filter((_,index)=>index%Math.max(2,Math.round(primary.length/5))===0).forEach((line,index)=>{
-    const mid=Math.floor(line.length*.46),strength=bifurcation/100*.34;
-    for(const sign of [-1,1])branches.push(line.slice(mid).map((point,i)=>{const t=i/Math.max(1,line.length-mid-1);return[point[0]+sign*strength*t*t,point[1]+(index%2?1:-1)*strength*.32*t,point[2]] as Vec}));
   });
-  return{primary,primaryRoles,offset,tweens,branches,ruled,anchors:entries.flatMap(entry=>entry.line.map(point=>({role:entry.role,point})))};
+  return{primary,primaryRoles,offset,tweens:[],branches,branchPlates,ruled,anchors:entries.flatMap(entry=>entry.line.map(point=>({role:entry.role,point})))};
 }
 
 async function exportRhinoSectionLines(slices:Slice[],version:7|8,fidelity:number){
@@ -503,44 +535,35 @@ async function exportRhinoSectionLines(slices:Slice[],version:7|8,fidelity:numbe
   downloadRhinoFile(file,rhino,version,`section-forge-boundary-lines-rhino${version}.3dm`);file.delete();
 }
 
-const EXPORT_TILE_INCHES=20;
+const EXPORT_TILE_INCHES=240;
 function exportDepth(slices:Slice[],index:number,height:number){
   if(slices.length<2)return height*.5;
   const first=slices[0].z,last=slices.at(-1)!.z,span=last-first||1;
   return(slices[index].z-first)/span*height;
 }
 
-function addPrintableForm(file:any,rhino:any,slices:Slice[],height:number){
-  const nx=44,ny=34,nz=slices.length,threshold=.32;
-  const occupied=Array.from({length:nz},(_,z)=>Array.from({length:ny},(_,y)=>Array.from({length:nx},(_,x)=>{
-    const sx=Math.round((x+.5)*(W-1)/nx),sy=Math.round((y+.5)*(H-1)/ny);
-    return slices[z].field[sy*W+sx]>=threshold;
-  })));
-  const centers=Array.from({length:nz},(_,index)=>exportDepth(slices,index,height));
-  const zBounds=Array.from({length:nz+1},(_,index)=>{
-    if(nz===1)return index*height;
-    if(index===0)return 0;if(index===nz)return height;
-    return(centers[index-1]+centers[index])*.5;
-  });
-  const mesh=new rhino.Mesh(),vertices=mesh.vertices(),faces=mesh.faces(),cache=new Map<string,number>();
-  const vertex=(x:number,y:number,z:number)=>{
-    const key=`${x}:${y}:${z}`,existing=cache.get(key);if(existing!==undefined)return existing;
-    const index=vertices.addPoint3d((x/nx-.5)*EXPORT_TILE_INCHES,(.5-y/ny)*EXPORT_TILE_INCHES,zBounds[z]);cache.set(key,index);return index;
-  };
-  const isFilled=(x:number,y:number,z:number)=>z>=0&&z<nz&&y>=0&&y<ny&&x>=0&&x<nx&&occupied[z][y][x];
-  const quad=(corners:[number,number,number][])=>faces.addQuadFace(...corners.map(([x,y,z])=>vertex(x,y,z)) as [number,number,number,number]);
-  for(let z=0;z<nz;z++)for(let y=0;y<ny;y++)for(let x=0;x<nx;x++){
-    if(!occupied[z][y][x])continue;
-    if(!isFilled(x-1,y,z))quad([[x,y,z],[x,y+1,z],[x,y+1,z+1],[x,y,z+1]]);
-    if(!isFilled(x+1,y,z))quad([[x+1,y,z],[x+1,y,z+1],[x+1,y+1,z+1],[x+1,y+1,z]]);
-    if(!isFilled(x,y-1,z))quad([[x,y,z],[x,y,z+1],[x+1,y,z+1],[x+1,y,z]]);
-    if(!isFilled(x,y+1,z))quad([[x,y+1,z],[x+1,y+1,z],[x+1,y+1,z+1],[x,y+1,z+1]]);
-    if(!isFilled(x,y,z-1))quad([[x,y,z],[x+1,y,z],[x+1,y+1,z],[x,y+1,z]]);
-    if(!isFilled(x,y,z+1))quad([[x,y,z+1],[x,y+1,z+1],[x+1,y+1,z+1],[x+1,y,z+1]]);
+function addPrintableForm(file:any,rhino:any,slices:Slice[],height:number,primaryCount:number,offsetsPerPrimary:number){
+  const railCount=primaryCount*(offsetsPerPrimary+1);
+  const rings=slices.map((slice,index)=>{
+    const loops=sectionContourLoops(slice.field),anchors=architecturalAnchors(loops,railCount);
+    return anchors.length===railCount?anchors.map(anchor=>[(anchor.point[0]/(W-1)-.5)*EXPORT_TILE_INCHES,(.5-anchor.point[1]/(H-1))*EXPORT_TILE_INCHES,exportDepth(slices,index,height)] as Vec):null;
+  }).filter((ring):ring is Vec[]=>Boolean(ring));
+  if(rings.length<2)return 0;
+  const mesh=new rhino.Mesh(),vertices=mesh.vertices(),faces=mesh.faces();
+  const ids=rings.map(ring=>ring.map(point=>vertices.addPoint3d(...point)));
+  for(let section=0;section<ids.length-1;section++)for(let rail=0;rail<railCount;rail++){
+    const next=(rail+1)%railCount;faces.addQuadFace(ids[section][rail],ids[section][next],ids[section+1][next],ids[section+1][rail]);
   }
+  const cap=(ring:Vec[],ringIds:number[],reverse:boolean)=>{
+    const center=ring.reduce((sum,point)=>[sum[0]+point[0],sum[1]+point[1],sum[2]+point[2]] as Vec,[0,0,0] as Vec).map(value=>value/ring.length) as Vec;
+    const centerId=vertices.addPoint3d(...center);
+    for(let rail=0;rail<railCount;rail++){const next=(rail+1)%railCount;reverse?faces.addTriangleFace(centerId,ringIds[next],ringIds[rail]):faces.addTriangleFace(centerId,ringIds[rail],ringIds[next]);}
+  };
+  cap(rings[0],ids[0],true);cap(rings.at(-1)!,ids.at(-1)!,false);
   mesh.normals().computeNormals();
   mesh.setUserString("GeometryType","Watertight SubD-derived printable mesh");
-  mesh.setUserString("Watertight","true");mesh.setUserString("SourceSections",String(slices.length));mesh.setUserString("TileEnvelope","20in x 20in");mesh.setUserString("OverallHeight",`${height}in`);
+  mesh.setUserString("Watertight","true");mesh.setUserString("SourceSections",String(rings.length));mesh.setUserString("TileEnvelope","20ft x 20ft maximum");mesh.setUserString("OverallHeight",`${height/12}ft`);
+  mesh.setUserString("RailLogic",`${primaryCount} primary lines with ${offsetsPerPrimary} offsets per primary (${railCount} ordered rails total)`);
   mesh.setUserString("PrintNote","Closed shared-vertex shell; verify scale and wall thickness before fabrication.");
   const layerIndex=file.layers().addLayer("01_PRINTABLE_SUBD_FORM",{r:124,g:205,b:194,a:255});
   const attributes=new rhino.ObjectAttributes();attributes.name="PRINTABLE_SUBD_FORM_WATERTIGHT";attributes.layerIndex=layerIndex;
@@ -573,73 +596,215 @@ function addBoundaryCurves(file:any,rhino:any,slices:Slice[],fidelity:number,hei
   return curveCount;
 }
 
-async function exportRhinoBundle(slices:Slice[],version:7|8,fidelity:number,height:number){
+async function exportRhinoBundle(slices:Slice[],version:7|8,fidelity:number,height:number,primaryCount:number,offsetsPerPrimary:number){
   if(!slices.length)return;
   const [{default:rhino3dm},{default:wasmUrl}]=await Promise.all([import("rhino3dm"),import("rhino3dm/rhino3dm.wasm?url")]);
   const rhino=await rhino3dm({locateFile:()=>wasmUrl}),file=new rhino.File3dm();
   const settings=file.settings();settings.modelUnitSystem=rhino.UnitSystem.Inches;settings.pageUnitSystem=rhino.UnitSystem.Feet;settings.modelAbsoluteTolerance=.001;
-  file.applicationName="Section Forge";file.applicationDetails=`20in x 20in imperial CT geometry package · Rhino ${version}`;
-  const faces=addPrintableForm(file,rhino,slices,height),surfaces=addSectionSurfaces(file,rhino,slices,height),curves=addBoundaryCurves(file,rhino,slices,fidelity,height);
-  file.startSectionComments=`Imperial one-file Section Forge export for Rhino ${version}. Model units: inches; layout units: feet. All geometry is constrained to a 20in x 20in (1ft-8in x 1ft-8in) tile and ${height}in overall height. Includes a closed printable form mesh (${faces} faces), ${surfaces} section surfaces, and ${curves} editable boundary curves on three numbered layers.`;
+  file.applicationName="Section Forge";file.applicationDetails=`20ft x 20ft maximum imperial unified-space package · Rhino ${version}`;
+  const faces=addPrintableForm(file,rhino,slices,height,primaryCount,offsetsPerPrimary),surfaces=addSectionSurfaces(file,rhino,slices,height),curves=addBoundaryCurves(file,rhino,slices,fidelity,height);
+  file.startSectionComments=`Imperial one-file Section Forge export for Rhino ${version}. Model units: inches; layout units: feet. All geometry is constrained to a maximum 20ft x 20ft footprint and ${height/12}ft overall height. The closed printable mesh is one ruled loft driven by ${primaryCount} primary lines with ${offsetsPerPrimary} offsets per primary through every section (${faces} faces), with ${surfaces} reference section surfaces and ${curves} editable boundary curves.`;
   downloadRhinoFile(file,rhino,version,`section-forge-complete-rhino${version}.3dm`);file.delete();
 }
 
-function SpatialChunkPreview({slices,position,onDragStart}:{slices:Slice[];position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
-  const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null);
-  const [camera,setCamera]=useState({yaw:-.68,pitch:.32,zoom:1}),[pointHierarchy,setPointHierarchy]=useState(62),[cageFidelity,setCageFidelity]=useState(80),[continuity,setContinuity]=useState(74),[voidPreservation,setVoidPreservation]=useState(88),[compactness,setCompactness]=useState(18),[cageOpacity,setCageOpacity]=useState(82),[ruledSurfaces,setRuledSurfaces]=useState(true);
-  const [visible,setVisible]=useState<Record<string,boolean>>({ridge:true,ground:true,extent:true,inflection:true,void:true,threshold:true});
-  const chunkSlices=useMemo(()=>{
-    if(!slices.length)return[] as Slice[];const count=Math.min(slices.length,Math.max(5,Math.round(5+compactness/100*6))),start=Math.max(0,Math.floor((slices.length-count)/2)),source=slices.slice(start,start+count),center=(source[0].z+source.at(-1)!.z)/2,span=Math.max(.001,Math.abs(source[0].z-source.at(-1)!.z)),depth=.95+compactness/100*1.35;
-    return source.map(slice=>({...slice,z:(slice.z-center)/span*depth}));
-  },[slices,compactness]);
-  const loops=useMemo(()=>chunkSlices.map(slice=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,cageFidelity))),[chunkSlices,cageFidelity]);
-  const families=useMemo(()=>longitudinalFamilies(chunkSlices,loops,Math.round(6+pointHierarchy/100*18),38,Math.round(continuity/28),30),[chunkSlices,loops,pointHierarchy,continuity]);
-  const category=(role:string)=>role.startsWith("ground")?"ground":role.startsWith("void")?"void":role.startsWith("threshold")?"threshold":role.startsWith("inflection")?"inflection":role==="ridge"?"ridge":"extent";
+function CirculationPreview({slices,fidelity,primaryCount,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,smoothing,settings,setSettings,heightInches,setHeightInches,position,onDragStart}:{slices:Slice[];fidelity:number;primaryCount:number;offsetsPerPrimary:number;bifurcationsPerPrimary:number;bifurcationDistance:number;bifurcationScale:number;smoothing:number;settings:CirculationSettings;setSettings:React.Dispatch<React.SetStateAction<CirculationSettings>>;heightInches:number;setHeightInches:(value:number)=>void;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+  const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null),[camera,setCamera]=useState({yaw:-.72,pitch:.38,zoom:1});
+  const normalized=useMemo(()=>{if(!slices.length)return[] as Slice[];const center=(slices[0].z+slices.at(-1)!.z)/2,span=Math.max(.001,Math.abs(slices[0].z-slices.at(-1)!.z));return slices.map(slice=>({...slice,z:(slice.z-center)/span*2.1}))},[slices]);
+  const loops=useMemo(()=>normalized.map(slice=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,fidelity))),[normalized,fidelity]);
+  const families=useMemo(()=>longitudinalFamilies(normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,[],{}),[normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale]);
+  const circulation=useMemo(()=>buildCirculationGeometry(families,settings,heightInches,bifurcationsPerPrimary),[families,settings,heightInches,bifurcationsPerPrimary]);
+  useEffect(()=>{setSettings(current=>({...current,primaryCount:Math.max(1,Math.min(current.primaryCount,Math.max(1,families.primary.length))),activeBranches:Math.min(current.activeBranches,bifurcationsPerPrimary)}))},[families.primary.length,bifurcationsPerPrimary,setSettings]);
   useEffect(()=>{
     const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;const width=c.width,height=c.height;ctx.fillStyle="#071014";ctx.fillRect(0,0,width,height);
-    if(!chunkSlices.length){ctx.fillStyle="#8fa9ae";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select images to build a spatial cage chunk",width/2,height/2);return}
-    const rotate=([x,y,z]:Vec):Vec=>{const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]},project=(point:Vec)=>{const [x,y,z]=rotate(point),perspective=5.4/(5.4+z),scale=205*camera.zoom*perspective;return{x:width*.5+x*scale,y:height*.54-y*scale,z}};
-    ctx.strokeStyle="rgba(55,90,105,.28)";ctx.lineWidth=.7;for(let i=-8;i<=8;i++){const a=project([i*.25,-.98,-1.5]),b=project([i*.25,-.98,1.5]),d=project([-1.5,-.98,i*.25]),e=project([1.5,-.98,i*.25]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);ctx.stroke()}
-    ctx.strokeStyle=`rgba(91,205,199,${cageOpacity/100*.62})`;ctx.lineWidth=.86;loops.forEach((section,index)=>section.forEach(loop=>{ctx.beginPath();loop.forEach(([x,y],pointIndex)=>{const p=project([(x/(W-1)-.5)*2.25,(.5-y/(H-1))*1.7,chunkSlices[index].z]);pointIndex?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});ctx.stroke()}));
-    if(ruledSurfaces)families.ruled.forEach(strip=>{const count=Math.min(strip.a.length,strip.b.length);for(let index=0;index<count-1;index++){const a=project(strip.a[index]),b=project(strip.b[index]),c=project(strip.b[index+1]),d=project(strip.a[index+1]);ctx.fillStyle=strip.kind==="void"?`rgba(255,171,68,${.05+voidPreservation/100*.12})`:`rgba(70,231,222,${.08+cageOpacity/100*.1})`;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(d.x,d.y);ctx.closePath();ctx.fill()}});
-    const draw=(line:Vec[],color:string,widthValue:number)=>{const pts=line.map(project);if(pts.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=widthValue;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(let i=1;i<pts.length-1;i++){const mid={x:(pts[i].x+pts[i+1].x)/2,y:(pts[i].y+pts[i+1].y)/2};ctx.quadraticCurveTo(pts[i].x,pts[i].y,mid.x,mid.y)}ctx.lineTo(pts.at(-1)!.x,pts.at(-1)!.y);ctx.stroke()};
-    families.tweens.forEach(line=>draw(line,"rgba(100,145,158,.23)",.65));families.offset.forEach(line=>draw(line,"rgba(189,84,211,.45)",.82));
-    families.primary.forEach((line,index)=>{const role=families.primaryRoles[index],kind=category(role);if(!visible[kind])return;const alpha=kind==="void"||kind==="threshold"?Math.max(.08,voidPreservation/100):1,color=kind==="ridge"?`rgba(255,98,219,${alpha})`:kind==="ground"?`rgba(54,151,255,${alpha})`:kind==="void"||kind==="threshold"?`rgba(255,171,68,${alpha})`:`rgba(70,231,222,${alpha})`;draw(line,color,1.75)});
-    families.branches.forEach(line=>draw(line,`rgba(255,166,70,${voidPreservation/100})`,1.2));families.anchors.forEach(({point,role})=>{const kind=category(role);if(!visible[kind])return;const p=project(point);ctx.fillStyle=kind==="ridge"?"#ff75dc":kind==="ground"?"#3d9dff":kind==="void"||kind==="threshold"?"#ffad4b":"#5eece1";ctx.beginPath();ctx.arc(p.x,p.y,1.8,0,Math.PI*2);ctx.fill()});
-    ctx.fillStyle="#8aa9ae";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`${chunkSlices.length} TRANSVERSE CAGES · COMPACT SPATIAL CHUNK`,14,20);
-  },[chunkSlices,loops,families,camera,cageOpacity,voidPreservation,visible,ruledSurfaces]);
-  const toggle=(key:string)=>setVisible(current=>({...current,[key]:!current[key]}));
-  const toggles:Array<[string,string]>=[["ridge","Ridge"],["ground","Ground"],["extent","Extents"],["inflection","Inflections"],["void","Void edges"],["threshold","Thresholds"]];
-  return <article className="spatial-chunk-node" style={{left:position.x,top:position.y}}>
-    <header onPointerDown={onDragStart}><div className="model-icon"><Box size={19}/></div><div><h2>Section Cage · Spatial Chunk</h2><p>Architectural anchors → longitudinal field</p></div><span>DRAG · 3D CAGE</span></header>
-    <div className="chunk-viewport"><canvas ref={canvas} width={760} height={430} aria-label="Rotatable 3D section cage spatial chunk" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.68,pitch:.32,zoom:1})}>Reset view</button><label><span>Cage opacity</span><input type="range" min="5" max="100" value={cageOpacity} onChange={event=>setCageOpacity(Number(event.target.value))}/><strong>{cageOpacity}%</strong></label></div>
-    <div className="geometry-mode"><span>Geometry display</span><div><button className={!ruledSurfaces?"active":""} onClick={()=>setRuledSurfaces(false)}>Ordered lines</button><button className={ruledSurfaces?"active":""} onClick={()=>setRuledSurfaces(true)}>Ruled surfaces</button></div><small>{families.ruled.length} strips between corresponding longitudinal rows</small></div>
-    <div className="chunk-controls"><label><span>Point hierarchy</span><strong>{pointHierarchy}%</strong><input type="range" min="0" max="100" value={pointHierarchy} onChange={event=>setPointHierarchy(Number(event.target.value))}/></label><label><span>Cage fidelity</span><strong>{cageFidelity}%</strong><input type="range" min="10" max="100" value={cageFidelity} onChange={event=>setCageFidelity(Number(event.target.value))}/></label><label><span>Longitudinal continuity</span><strong>{continuity}%</strong><input type="range" min="0" max="100" value={continuity} onChange={event=>setContinuity(Number(event.target.value))}/></label><label><span>Void preservation</span><strong>{voidPreservation}%</strong><input type="range" min="0" max="100" value={voidPreservation} onChange={event=>setVoidPreservation(Number(event.target.value))}/></label><label><span>Compactness</span><strong>{compactness}%</strong><input type="range" min="0" max="100" value={compactness} onChange={event=>setCompactness(Number(event.target.value))}/><small>Sectional fragment</small><small>Building scale</small></label></div>
-    <div className="chunk-toggles">{toggles.map(([key,label])=><button key={key} className={visible[key]?"active":""} onClick={()=>toggle(key)} aria-pressed={visible[key]}><i className={key}/>{label}</button>)}</div>
-    <div className="chunk-summary"><span><strong>{chunkSlices.length}</strong> transverse cages</span><span><strong>Compact</strong> spatial chunk</span><span><strong>1</strong> continuous void</span><span><strong>Grounded</strong></span></div>
-    <span className="port port-top" aria-hidden="true"/>
+    if(!circulation.ribbons.length){ctx.fillStyle="#8fa9ae";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select depth sections to generate circulation",width/2,height/2);return}
+    const rotate=([x,y,z]:Vec):Vec=>{const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]},project=(point:Vec)=>{const [x,y,z]=rotate(point),perspective=5.2/(5.2+z),scale=180*camera.zoom*perspective;return{x:width*.5+x*scale,y:height*.54-y*scale,z}};
+    const bottom=[[-CHUNK_HALF,circulation.floorY,-CHUNK_HALF],[CHUNK_HALF,circulation.floorY,-CHUNK_HALF],[CHUNK_HALF,circulation.floorY,CHUNK_HALF],[-CHUNK_HALF,circulation.floorY,CHUNK_HALF]] as Vec[],top=bottom.map(([x,,z])=>[x,circulation.topY,z] as Vec);ctx.strokeStyle="rgba(119,205,199,.28)";ctx.lineWidth=.8;for(const ring of [bottom,top]){ctx.beginPath();ring.forEach((p,i)=>{const s=project(p);i?ctx.lineTo(s.x,s.y):ctx.moveTo(s.x,s.y)});ctx.closePath();ctx.stroke()}for(let i=0;i<4;i++){const a=project(bottom[i]),b=project(top[i]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke()}
+    const cells=circulation.ribbons.flatMap(ribbon=>Array.from({length:Math.max(0,Math.min(ribbon.left.length,ribbon.right.length)-1)},(_,index)=>{const screen=[ribbon.left[index],ribbon.right[index],ribbon.right[index+1],ribbon.left[index+1]].map(project);return{screen,depth:screen.reduce((sum,p)=>sum+p.z,0)/4,kind:ribbon.kind}})).sort((a,b)=>b.depth-a.depth);
+    cells.forEach(cell=>{ctx.fillStyle=cell.kind==="spine"?"rgba(95,231,218,.34)":"rgba(242,151,72,.3)";ctx.strokeStyle=cell.kind==="spine"?"rgba(166,255,245,.72)":"rgba(255,203,127,.7)";ctx.lineWidth=.65;ctx.beginPath();ctx.moveTo(cell.screen[0].x,cell.screen[0].y);for(let i=1;i<4;i++)ctx.lineTo(cell.screen[i].x,cell.screen[i].y);ctx.closePath();ctx.fill();ctx.stroke()});
+    circulation.ribbons.forEach(ribbon=>{const points=ribbon.center.map(project);ctx.strokeStyle=ribbon.kind==="spine"?"rgba(95,231,218,.96)":"rgba(255,184,97,.9)";ctx.lineWidth=ribbon.kind==="spine"?2:1.4;ctx.beginPath();points.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.stroke()});ctx.fillStyle="#789a9d";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`20′ × 20′ ENVELOPE · ${heightInches/12}′ HEIGHT · ONE OCCUPIABLE FLOOR`,14,20);
+  },[circulation,camera,heightInches]);
+  return <article className="spatial-rational-node circulation-node" style={{left:position.x,top:position.y}}>
+    <header onPointerDown={onDragStart}><div className="model-icon"><Route size={19}/></div><div><h2>Circulation Skeleton</h2><p>True 3D cage lines → multiple occupiable routes</p></div><span>DRAG · ORBIT</span></header>
+    <div className="rational-viewport"><canvas ref={canvas} width={700} height={390} aria-label="Rotatable 3D preview of circulation routes constrained to a twenty foot square spatial chunk" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.72,pitch:.38,zoom:1})}>Reset view</button></div>
+    <div className="spatial-constraint-band"><strong>20′ × 20′</strong><span>Single occupiable floor</span><span>Outside geometry trimmed</span><label>Height <b>{heightInches/12}′</b><input type="range" min="96" max="240" step="12" value={heightInches} onChange={event=>setHeightInches(Number(event.target.value))}/></label></div>
+    <div className="rational-controls">
+      <label><span>Primary circulations</span><strong>{Math.min(settings.primaryCount,Math.max(1,families.primary.length))}</strong><input type="range" min="1" max={Math.max(1,families.primary.length)} step="1" value={Math.min(settings.primaryCount,Math.max(1,families.primary.length))} onChange={event=>setSettings(current=>({...current,primaryCount:Number(event.target.value)}))}/><small>Evenly distributed cage lines, preserved in XYZ</small></label>
+      <label><span>Path width</span><strong>{settings.pathWidth}′</strong><input type="range" min="4" max="8" step=".5" value={settings.pathWidth} onChange={event=>setSettings(current=>({...current,pathWidth:Number(event.target.value)}))}/><small>Clear occupiable route</small></label>
+      <label><span>Bifurcations per primary</span><strong>{settings.activeBranches}</strong><input type="range" min="0" max={Math.max(0,bifurcationsPerPrimary)} step="1" value={Math.min(settings.activeBranches,bifurcationsPerPrimary)} onChange={event=>setSettings(current=>({...current,activeBranches:Number(event.target.value)}))}/><small>Repeated for every selected primary route</small></label>
+      <label><span>Junction widening</span><strong>{settings.junctionWidth}%</strong><input type="range" min="0" max="100" step="5" value={settings.junctionWidth} onChange={event=>setSettings(current=>({...current,junctionWidth:Number(event.target.value)}))}/><small>Threshold expansion</small></label>
+      <label><span>Route smoothing</span><strong>{settings.smoothing}%</strong><input type="range" min="0" max="100" step="5" value={settings.smoothing} onChange={event=>setSettings(current=>({...current,smoothing:Number(event.target.value)}))}/><small>Remove directional noise</small></label>
+    </div>
+    <div className="rational-summary"><span><strong>{Math.min(settings.primaryCount,Math.max(1,families.primary.length))}</strong>primary routes</span><span><strong>{circulation.ribbons.length}</strong>3D paths</span><span><strong>{circulation.trimmedCount}</strong>points trimmed</span><span><strong>XYZ</strong>cage preserved</span></div>
+    <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
   </article>;
 }
 
-function BoundaryLinesPreview({slices,activeIndex,fidelity,setFidelity,position,onDragStart}:{slices:Slice[];activeIndex:number;fidelity:number;setFidelity:(value:number)=>void;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
-  const canvas=useRef<HTMLCanvasElement>(null);
-  const orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null);
-  const [camera,setCamera]=useState({yaw:-.68,pitch:.34,zoom:1});
-  const [pointExtraction,setPointExtraction]=useState(12),[offsetAmount,setOffsetAmount]=useState(46),[tweenCount,setTweenCount]=useState(2),[bifurcation,setBifurcation]=useState(38),[ruledSurfaces,setRuledSurfaces]=useState(true);
+function CageCirculationPreview({slices,fidelity,primaryCount,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,smoothing,circulationSettings,heightInches,position,onDragStart}:{slices:Slice[];fidelity:number;primaryCount:number;offsetsPerPrimary:number;bifurcationsPerPrimary:number;bifurcationDistance:number;bifurcationScale:number;smoothing:number;circulationSettings:CirculationSettings;heightInches:number;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+  type FrameworkView="perspective"|"top"|"front"|"back"|"left"|"right";
+  const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null),[view,setView]=useState<FrameworkView>("perspective"),[camera,setCamera]=useState({yaw:-.72,pitch:.36}),[zoom,setZoom]=useState(1),[pathEmphasis,setPathEmphasis]=useState(72);
+  const normalized=useMemo(()=>{if(!slices.length)return[] as Slice[];const center=(slices[0].z+slices.at(-1)!.z)/2,span=Math.max(.001,Math.abs(slices[0].z-slices.at(-1)!.z));return slices.map(slice=>({...slice,z:(slice.z-center)/span*2.1}))},[slices]);
+  const loops=useMemo(()=>normalized.map(slice=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,fidelity))),[normalized,fidelity]);
+  const families=useMemo(()=>longitudinalFamilies(normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,[],{}),[normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale]);
+  const circulation=useMemo(()=>buildCirculationGeometry(families,circulationSettings,heightInches,bifurcationsPerPrimary),[families,circulationSettings,heightInches,bifurcationsPerPrimary]);
+  useEffect(()=>{
+    const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;const width=c.width,height=c.height;ctx.fillStyle="#071014";ctx.fillRect(0,0,width,height);
+    if(!normalized.length){ctx.fillStyle="#8fa9ae";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select depth sections to combine cage and circulation",width/2,height/2);return}
+    const orient=([x,y,z]:Vec):Vec=>{if(view==="perspective"){const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]}return view==="top"?[x,-z,y]:view==="front"?[x,y,z]:view==="back"?[-x,y,-z]:view==="left"?[z,y,x]:[-z,y,-x]},project=(point:Vec)=>{const [x,y,depth]=orient(point),perspective=view==="perspective"?5.25/(5.25+depth):1,scale=166*zoom*perspective;return{x:width*.5+x*scale,y:height*.53-y*scale,z:depth}};
+    const transverse=loops.flatMap((section,index)=>section.map(loop=>loop.map(([x,y])=>[(x/(W-1)-.5)*2.25,(.5-y/(H-1))*1.7,normalized[index].z] as Vec))).map(line=>({line,depth:line.reduce((sum,p)=>sum+orient(p)[2],0)/Math.max(1,line.length)})).sort((a,b)=>b.depth-a.depth);
+    transverse.forEach(({line})=>{const points=line.map(project);ctx.strokeStyle="rgba(94,139,144,.25)";ctx.lineWidth=.55;ctx.beginPath();points.forEach((p,index)=>index?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.closePath();ctx.stroke()});
+    const draw=(lines:Vec[][],color:string,lineWidth:number)=>lines.forEach(line=>{const points=line.map(project);if(points.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=lineWidth;ctx.beginPath();ctx.moveTo(points[0].x,points[0].y);for(let index=1;index<points.length-1;index++){const next=points[index+1],mid={x:(points[index].x+next.x)/2,y:(points[index].y+next.y)/2};ctx.quadraticCurveTo(points[index].x,points[index].y,mid.x,mid.y)}ctx.lineTo(points.at(-1)!.x,points.at(-1)!.y);ctx.stroke()});
+    draw(families.offset,"rgba(211,109,224,.46)",.75);draw(families.primary,"rgba(95,231,218,.84)",1.25);draw(families.branches,"rgba(255,184,97,.72)",1);
+    const alpha=.2+pathEmphasis/100*.45,cells=circulation.ribbons.flatMap(ribbon=>Array.from({length:Math.max(0,Math.min(ribbon.left.length,ribbon.right.length)-1)},(_,index)=>{const screen=[ribbon.left[index],ribbon.right[index],ribbon.right[index+1],ribbon.left[index+1]].map(project);return{screen,depth:screen.reduce((sum,p)=>sum+p.z,0)/4,kind:ribbon.kind}})).sort((a,b)=>b.depth-a.depth);
+    cells.forEach(cell=>{ctx.fillStyle=cell.kind==="spine"?`rgba(95,231,218,${alpha})`:`rgba(242,151,72,${alpha*.9})`;ctx.strokeStyle=cell.kind==="spine"?"rgba(198,255,248,.7)":"rgba(255,211,145,.66)";ctx.lineWidth=.7;ctx.beginPath();ctx.moveTo(cell.screen[0].x,cell.screen[0].y);for(let index=1;index<4;index++)ctx.lineTo(cell.screen[index].x,cell.screen[index].y);ctx.closePath();ctx.fill();ctx.stroke()});
+    circulation.ribbons.forEach(ribbon=>draw([ribbon.center],ribbon.kind==="spine"?"rgba(225,255,251,.96)":"rgba(255,222,172,.92)",ribbon.kind==="spine"?2.2:1.6));ctx.fillStyle="#789a9d";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`${view.toUpperCase()} ${view==="perspective"?"VIEW":"ORTHOGRAPHIC"} · SECTION CAGE + OCCUPIABLE CIRCULATION`,14,20);
+  },[normalized,loops,families,circulation,view,camera,zoom,pathEmphasis]);
+  return <article className="spatial-rational-node combined-framework-node" style={{left:position.x,top:position.y}}>
+    <header onPointerDown={onDragStart}><div className="model-icon"><Layers3 size={19}/></div><div><h2>Cage + Circulation Framework</h2><p>Unified section lines and occupiable paths</p></div><span>DRAG · MULTIVIEW</span></header>
+    <div className="geometry-mode framework-view-switcher"><span>Viewport</span><div>{(["perspective","top","front","back","left","right"] as FrameworkView[]).map(option=><button key={option} className={view===option?"active":""} onClick={()=>setView(option)}>{option[0].toUpperCase()+option.slice(1)}</button>)}</div><small>Perspective supports orbiting; architectural elevations and plan use undistorted parallel projection.</small></div>
+    <div className="rational-viewport"><canvas ref={canvas} width={700} height={390} aria-label={`${view} view of the unified section cage and circulation skeleton`} onPointerDown={event=>{if(view!=="perspective")return;event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(!start||view!=="perspective")return;setCamera({yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))})}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setZoom(value=>Math.max(.55,Math.min(2.2,value-event.deltaY*.0012)))}}/><span>{view==="perspective"?"Drag to orbit · wheel to zoom":`Wheel to zoom · ${view} orthographic`}</span><button onClick={()=>{setZoom(1);setCamera({yaw:-.72,pitch:.36})}}>Reset view</button></div>
+    <div className="spatial-constraint-band"><strong>20′ × 20′</strong><span>{heightInches/12}′ adjustable height</span><span>Cage preserved in XYZ</span><span>One circulation system</span></div>
+    <div className="rational-controls"><label><span>Circulation emphasis</span><strong>{pathEmphasis}%</strong><input type="range" min="10" max="100" step="5" value={pathEmphasis} onChange={event=>setPathEmphasis(Number(event.target.value))}/><small>Cage dominant</small><small>Paths dominant</small></label></div>
+    <div className="rational-summary"><span><strong>{families.primary.length}</strong>primary cage lines</span><span><strong>{families.offset.length}</strong>offset lines</span><span><strong>{families.branches.length}</strong>bifurcations</span><span><strong>{circulation.ribbons.length}</strong>circulation paths</span></div>
+    <p className="rational-note">The section cage remains the geometric reference system. Circulation is overlaid on selected primary and bifurcating lines, so the occupiable paths can be evaluated without losing the original longitudinal hierarchy.</p>
+    <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
+  </article>;
+}
+
+function UnifiedFloorPlatePreview({slices,fidelity,primaryCount,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,smoothing,circulationSettings,settings,setSettings,heightInches,position,onDragStart}:{slices:Slice[];fidelity:number;primaryCount:number;offsetsPerPrimary:number;bifurcationsPerPrimary:number;bifurcationDistance:number;bifurcationScale:number;smoothing:number;circulationSettings:CirculationSettings;settings:FloorPlateSettings;setSettings:React.Dispatch<React.SetStateAction<FloorPlateSettings>>;heightInches:number;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+  const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null),[camera,setCamera]=useState({yaw:-.72,pitch:.34,zoom:1});
+  const normalized=useMemo(()=>{if(!slices.length)return[] as Slice[];const center=(slices[0].z+slices.at(-1)!.z)/2,span=Math.max(.001,Math.abs(slices[0].z-slices.at(-1)!.z));return slices.map(slice=>({...slice,z:(slice.z-center)/span*2.1}))},[slices]);
+  const loops=useMemo(()=>normalized.map(slice=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,fidelity))),[normalized,fidelity]);
+  const families=useMemo(()=>longitudinalFamilies(normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,[],{}),[normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale]);
+  const circulation=useMemo(()=>buildCirculationGeometry(families,circulationSettings,heightInches,bifurcationsPerPrimary),[families,circulationSettings,heightInches,bifurcationsPerPrimary]),plate=useMemo(()=>buildUnifiedFloorPlate(circulation,settings),[circulation,settings]);
+  useEffect(()=>{
+    const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;const width=c.width,height=c.height;ctx.fillStyle="#071014";ctx.fillRect(0,0,width,height);
+    if(!plate.profiles.length){ctx.fillStyle="#8fa9ae";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Generate circulation to form paths and occupiable spaces",width/2,height/2);return}
+    const rotate=([x,y,z]:Vec):Vec=>{const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]},project=(point:Vec)=>{const [x,y,z]=rotate(point),perspective=5.3/(5.3+z),scale=180*camera.zoom*perspective;return{x:width*.5+x*scale,y:height*.53-y*scale,z}};
+    const cells=plate.profiles.flatMap(route=>route.slice(0,-1).map((profile,index)=>{const screen=[profile[0],route[index+1][0],route[index+1][1],profile[1]].map(project);return{screen,depth:screen.reduce((sum,p)=>sum+p.z,0)/4}})).sort((a,b)=>b.depth-a.depth);
+    cells.forEach(cell=>{ctx.fillStyle="rgba(71,177,168,.72)";ctx.strokeStyle="rgba(185,245,238,.38)";ctx.lineWidth=.5;ctx.beginPath();ctx.moveTo(cell.screen[0].x,cell.screen[0].y);for(let i=1;i<4;i++)ctx.lineTo(cell.screen[i].x,cell.screen[i].y);ctx.closePath();ctx.fill();ctx.stroke()});
+    plate.profiles.forEach(route=>route.forEach((profile,index)=>{if(index%Math.max(1,Math.floor(route.length/8))!==0&&index!==route.length-1)return;const points=profile.map(project);ctx.strokeStyle="rgba(222,255,251,.55)";ctx.lineWidth=.6;ctx.beginPath();points.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.stroke()}));ctx.fillStyle="#789a9d";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`3D RULED FLOOR SURFACES · ${heightInches/12}′ MAX ENVELOPE HEIGHT`,14,20);
+  },[plate,camera,heightInches]);
+  return <article className="spatial-rational-node floor-plate-node" style={{left:position.x,top:position.y}}>
+    <header onPointerDown={onDragStart}><div className="model-icon"><Layers3 size={19}/></div><div><h2>Unified Floor Plate</h2><p>3D circulation rails → ruled paths and spaces</p></div><span>DRAG · ORBIT</span></header>
+    <div className="rational-viewport"><canvas ref={canvas} width={760} height={420} aria-label="Rotatable preview of three-dimensional ruled floor surfaces derived from circulation lines" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.72,pitch:.34,zoom:1})}>Reset view</button></div>
+    <div className="spatial-constraint-band"><strong>20′ × 20′</strong><span>{heightInches/12}′ adjustable height</span><span>One floor only</span><span>Envelope trim active</span></div>
+    <div className="rational-controls floor-controls">
+      <label><span>Noise removal</span><strong>{settings.noiseReduction}%</strong><input type="range" min="0" max="100" step="5" value={settings.noiseReduction} onChange={event=>setSettings(current=>({...current,noiseReduction:Number(event.target.value)}))}/><small>Simplifies hooks and short deviations</small></label>
+      <label><span>Floor plate thickness</span><strong>{settings.plateThickness}″</strong><input type="range" min="6" max="18" step="1" value={settings.plateThickness} onChange={event=>setSettings(current=>({...current,plateThickness:Number(event.target.value)}))}/><small>Single occupiable datum</small></label>
+      <label><span>Path-to-space expansion</span><strong>{settings.surfaceFlow}%</strong><input type="range" min="0" max="100" step="5" value={settings.surfaceFlow} onChange={event=>setSettings(current=>({...current,surfaceFlow:Number(event.target.value)}))}/><small>Direct circulation band</small><small>Expanded occupiable nodes</small></label>
+    </div>
+    <div className="rational-summary"><span><strong>1</strong>continuous floor system</span><span><strong>{plate.profiles.length}</strong>rail pairs</span><span><strong>{plate.cellCount}</strong>ruled faces</span><span><strong>{settings.surfaceFlow}%</strong>space expansion</span></div>
+    <p className="rational-note">Adjacent circulation lines are now the actual surface rails. Their corresponding section points are connected by straight rulings, producing floor plates that span between the cage-derived paths while retaining both rails’ height and curvature. No offset ribbon substitutes for the circulation lines, and no enclosure is added.</p>
+    <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
+  </article>;
+}
+
+function UnifiedRuledMeshPreview({slices,fidelity,primaryCount,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,smoothing,circulationSettings,floorSettings,heightInches,position,onDragStart}:{slices:Slice[];fidelity:number;primaryCount:number;offsetsPerPrimary:number;bifurcationsPerPrimary:number;bifurcationDistance:number;bifurcationScale:number;smoothing:number;circulationSettings:CirculationSettings;floorSettings:FloorPlateSettings;heightInches:number;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+  const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null);
+  const [camera,setCamera]=useState({yaw:-.68,pitch:.32,zoom:1}),[meshOpacity,setMeshOpacity]=useState(88),[wireframe,setWireframe]=useState(true);
+  const meshSlices=useMemo(()=>{
+    if(!slices.length)return[] as Slice[];const center=(slices[0].z+slices.at(-1)!.z)/2,span=Math.max(.001,Math.abs(slices[0].z-slices.at(-1)!.z));
+    return slices.map(slice=>({...slice,z:(slice.z-center)/span*2.1}));
+  },[slices]);
+  const loops=useMemo(()=>meshSlices.map(slice=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,fidelity))),[meshSlices,fidelity]);
+  const families=useMemo(()=>longitudinalFamilies(meshSlices,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,[],{}),[meshSlices,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale]);
+  const circulation=useMemo(()=>buildCirculationGeometry(families,circulationSettings,heightInches,bifurcationsPerPrimary),[families,circulationSettings,heightInches,bifurcationsPerPrimary]),plate=useMemo(()=>buildUnifiedFloorPlate(circulation,floorSettings),[circulation,floorSettings]);
+  useEffect(()=>{
+    const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;const width=c.width,height=c.height;ctx.fillStyle="#071014";ctx.fillRect(0,0,width,height);
+    if(!meshSlices.length){ctx.fillStyle="#8fa9ae";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select images to generate the unified ruled mesh",width/2,height/2);return}
+    const rotate=([x,y,z]:Vec):Vec=>{const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]},project=(point:Vec)=>{const [x,y,z]=rotate(point),perspective=5.4/(5.4+z),scale=205*camera.zoom*perspective;return{x:width*.5+x*scale,y:height*.54-y*scale,z}};
+    ctx.strokeStyle="rgba(55,90,105,.28)";ctx.lineWidth=.7;for(let i=-8;i<=8;i++){const a=project([i*.25,circulation.floorY,-CHUNK_HALF]),b=project([i*.25,circulation.floorY,CHUNK_HALF]),d=project([-CHUNK_HALF,circulation.floorY,i*.25]),e=project([CHUNK_HALF,circulation.floorY,i*.25]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);ctx.stroke()}
+    const cells=plate.profiles.flatMap(route=>route.slice(0,-1).map((profile,index)=>{const screen=[profile[0],route[index+1][0],route[index+1][1],profile[1]].map(project);return{screen,depth:screen.reduce((sum,p)=>sum+p.z,0)/4}})).sort((a,b)=>b.depth-a.depth);
+    cells.forEach(cell=>{const depthTone=Math.max(0,Math.min(1,(cell.depth+2.2)/4.4)),alpha=.22+meshOpacity/100*.62;ctx.fillStyle=`rgba(${Math.round(40+depthTone*32)},${Math.round(148+depthTone*76)},${Math.round(150+depthTone*67)},${alpha})`;ctx.strokeStyle=wireframe?`rgba(181,255,246,${.18+meshOpacity/100*.5})`:"transparent";ctx.lineWidth=.55;ctx.beginPath();ctx.moveTo(cell.screen[0].x,cell.screen[0].y);for(let i=1;i<4;i++)ctx.lineTo(cell.screen[i].x,cell.screen[i].y);ctx.closePath();ctx.fill();if(wireframe)ctx.stroke()});
+    const draw=(line:Vec[],color:string,widthValue:number)=>{const pts=line.map(project);if(pts.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=widthValue;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(let i=1;i<pts.length-1;i++){const mid={x:(pts[i].x+pts[i+1].x)/2,y:(pts[i].y+pts[i+1].y)/2};ctx.quadraticCurveTo(pts[i].x,pts[i].y,mid.x,mid.y)}ctx.lineTo(pts.at(-1)!.x,pts.at(-1)!.y);ctx.stroke()};
+    if(wireframe)circulation.ribbons.forEach(ribbon=>draw(ribbon.center,ribbon.kind==="spine"?"rgba(202,255,247,.9)":"rgba(255,178,91,.92)",ribbon.kind==="spine"?1.25:1));
+    ctx.fillStyle="#8aa9ae";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`20′ × 20′ · ${heightInches/12}′ HIGH · ONE FLOOR · ${cells.length} RATIONALIZED FACES`,14,20);
+  },[meshSlices,plate,circulation,camera,meshOpacity,wireframe,heightInches]);
+  return <article className="spatial-chunk-node" style={{left:position.x,top:position.y}}>
+    <header onPointerDown={onDragStart}><div className="model-icon"><Box size={19}/></div><div><h2>Unified Ruled Mesh</h2><p>3D ruled floor plates → continuous quad mesh</p></div><span>DRAG · 3D MESH</span></header>
+    <div className="chunk-viewport"><canvas ref={canvas} width={760} height={430} aria-label="Rotatable 3D preview of the unified ruled surface mesh" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.68,pitch:.32,zoom:1})}>Reset view</button><label><span>Mesh opacity</span><input type="range" min="10" max="100" value={meshOpacity} onChange={event=>setMeshOpacity(Number(event.target.value))}/><strong>{meshOpacity}%</strong></label></div>
+    <div className="spatial-constraint-band mesh-constraint"><strong>20′ × 20′</strong><span>{heightInches/12}′ adjustable height</span><span>1 occupiable floor</span><span>Trimmed envelope</span></div>
+    <div className="geometry-mode"><span>Mesh display</span><div><button className={!wireframe?"active":""} onClick={()=>setWireframe(false)}>Shaded</button><button className={wireframe?"active":""} onClick={()=>setWireframe(true)}>Shaded + edges</button></div><small>Ruled floor surfaces preserve circulation height · no enclosure</small></div>
+    <div className="chunk-summary"><span><strong>1</strong>floor plate</span><span><strong>{circulation.ribbons.length}</strong>circulation bands</span><span><strong>{plate.profiles.length}</strong>rail pairs</span><span><strong>{plate.cellCount}</strong>plate faces</span></div>
+    <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
+  </article>;
+}
+
+function ReadOnlyBoundaryLinesPreview({slices,activeIndex,fidelity,setFidelity,primaryCount,setPrimaryCount,offsetsPerPrimary,setOffsetsPerPrimary,bifurcationsPerPrimary,setBifurcationsPerPrimary,bifurcationDistance,setBifurcationDistance,bifurcationScale,setBifurcationScale,smoothing,setSmoothing,position,onDragStart}:{slices:Slice[];activeIndex:number;fidelity:number;setFidelity:(value:number)=>void;primaryCount:number;setPrimaryCount:(value:number)=>void;offsetsPerPrimary:number;setOffsetsPerPrimary:(value:number)=>void;bifurcationsPerPrimary:number;setBifurcationsPerPrimary:(value:number)=>void;bifurcationDistance:number;setBifurcationDistance:(value:number)=>void;bifurcationScale:number;setBifurcationScale:(value:number)=>void;smoothing:number;setSmoothing:(value:number)=>void;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+  const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null);
+  const [camera,setCamera]=useState({yaw:-.68,pitch:.34,zoom:1}),[ruledSurfaces,setRuledSurfaces]=useState(true);
   const loops=useMemo(()=>slices.map(slice=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,fidelity))),[slices,fidelity]);
-  const families=useMemo(()=>longitudinalFamilies(slices,loops,pointExtraction,offsetAmount,tweenCount,bifurcation),[slices,loops,pointExtraction,offsetAmount,tweenCount,bifurcation]);
+  const families=useMemo(()=>longitudinalFamilies(slices,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,[],{}),[slices,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale]);
   const pointCount=families.anchors.length;
   useEffect(()=>{
     const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;const width=c.width,height=c.height;
     const background=ctx.createLinearGradient(0,0,0,height);background.addColorStop(0,"#111a1d");background.addColorStop(1,"#080d0f");ctx.fillStyle=background;ctx.fillRect(0,0,width,height);
     if(!slices.length){ctx.fillStyle="#829da0";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select depth-map sections to trace",width/2,height/2);return}
+    const zCenter=(slices[0].z+slices.at(-1)!.z)/2,rotate=([x,y,z]:Vec):Vec=>{z-=zCenter;const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]},project=(point:Vec)=>{const [x,y,z]=rotate(point),perspective=5/(5+z),scale=150*camera.zoom*perspective;return{x:width*.5+x*scale,y:height*.51-y*scale,z}};
+    ctx.strokeStyle="rgba(67,98,103,.26)";ctx.lineWidth=.7;for(let i=-7;i<=7;i++){const a=project([i*.38,-1.03,zCenter-2.8]),b=project([i*.38,-1.03,zCenter+2.8]),d=project([-2.8,-1.03,zCenter+i*.38]),e=project([2.8,-1.03,zCenter+i*.38]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);ctx.stroke()}
+    const rendered=loops.flatMap((section,index)=>section.map(loop=>({index,points:loop.map(([x,y])=>[(x/(W-1)-.5)*2.25,(.5-y/(H-1))*1.7,slices[index].z] as Vec)}))).map(item=>({...item,depth:item.points.reduce((sum,point)=>sum+rotate(point)[2],0)/Math.max(1,item.points.length)})).sort((a,b)=>b.depth-a.depth);
+    rendered.forEach(item=>{const active=item.index===activeIndex;ctx.strokeStyle=active?"rgba(155,235,224,.68)":"rgba(82,136,137,.22)";ctx.lineWidth=active?1.35:.62;ctx.beginPath();item.points.forEach((point,index)=>{const p=project(point);index?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});ctx.stroke()});
+    if(ruledSurfaces)[...families.ruled,...families.branchPlates].forEach(strip=>{const count=Math.min(strip.a.length,strip.b.length),branch=families.branchPlates.includes(strip);for(let index=0;index<count-1;index++){const a=project(strip.a[index]),b=project(strip.b[index]),c=project(strip.b[index+1]),d=project(strip.a[index+1]);ctx.fillStyle=branch?"rgba(242,151,72,.3)":"rgba(95,231,218,.12)";ctx.strokeStyle=branch?"rgba(255,203,127,.7)":"rgba(95,231,218,.18)";ctx.lineWidth=branch ? .55 : .45;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(d.x,d.y);ctx.closePath();ctx.fill();ctx.stroke()}});
+    const draw=(lines:Vec[][],color:string,width:number,glow=0)=>lines.forEach(line=>{const points=line.map(project);if(points.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=width;ctx.shadowColor=color;ctx.shadowBlur=glow;ctx.beginPath();ctx.moveTo(points[0].x,points[0].y);for(let i=1;i<points.length-1;i++){const midpoint={x:(points[i].x+points[i+1].x)/2,y:(points[i].y+points[i+1].y)/2};ctx.quadraticCurveTo(points[i].x,points[i].y,midpoint.x,midpoint.y)}ctx.lineTo(points.at(-1)!.x,points.at(-1)!.y);ctx.stroke();ctx.shadowBlur=0});
+    draw(families.offset,"rgba(211,109,224,.54)",.85);draw(families.primary,"rgba(95,231,218,.92)",1.55,3);draw(families.branches,"rgba(255,184,97,.85)",1.15,2);
+    families.anchors.forEach(({point})=>{const p=project(point);ctx.fillStyle="#d7fff8";ctx.beginPath();ctx.arc(p.x,p.y,1.35,0,Math.PI*2);ctx.fill()});
+    ctx.fillStyle="#739396";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`TRANSVERSE CAGE · SECTION ${activeIndex+1} / ${slices.length}`,14,20);ctx.textAlign="right";ctx.fillText(`${pointCount} EXTRACTED POINTS`,width-14,20);
+  },[slices,loops,families,activeIndex,pointCount,camera,ruledSurfaces]);
+  return <article className="boundary-lines-node" style={{left:position.x,top:position.y}}>
+    <header onPointerDown={onDragStart}><div className="model-icon"><ScanLine size={19}/></div><div><h2>Unified Section Cage</h2><p>Read-only longitudinal line system</p></div><span>DRAG · ORBIT</span></header>
+    <div className="boundary-viewport"><canvas ref={canvas} width={620} height={350} aria-label="Rotatable read-only 3D preview of transverse section cages and longitudinal line families" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.68,pitch:.34,zoom:1})}>Reset view</button></div>
+    <div className="geometry-mode"><span>Display</span><div><button className={!ruledSurfaces?"active":""} onClick={()=>setRuledSurfaces(false)}>Line hierarchy</button><button className={ruledSurfaces?"active":""} onClick={()=>setRuledSurfaces(true)}>Unified ruled skin</button></div><small>{families.primary.length} primary · {families.offset.length} offset · {families.branches.length} bifurcating lines</small></div>
+    <div className="boundary-fidelity line-method-controls">
+      <label><span>Primary lines</span><strong>{primaryCount}</strong><input type="range" min="3" max="12" step="1" value={primaryCount} onChange={event=>setPrimaryCount(Number(event.target.value))}/><small>Broad structure</small><small>Dense hierarchy</small></label>
+      <label><span>Offsets per primary line</span><strong>{offsetsPerPrimary}</strong><input type="range" min="0" max="6" step="1" value={offsetsPerPrimary} onChange={event=>setOffsetsPerPrimary(Number(event.target.value))}/><small>Primary only</small><small>6 offsets each</small></label>
+      <label><span>Bifurcations per primary line</span><strong>{bifurcationsPerPrimary}</strong><input type="range" min="0" max="6" step="1" value={bifurcationsPerPrimary} onChange={event=>setBifurcationsPerPrimary(Number(event.target.value))}/><small>No branches</small><small>6 nested branches</small></label>
+      <label><span>Bifurcation distance</span><strong>{bifurcationDistance}%</strong><input type="range" min="10" max="100" step="5" value={bifurcationDistance} onChange={event=>setBifurcationDistance(Number(event.target.value))}/><small>Short threshold</small><small>Long traverse</small></label>
+      <label><span>Bifurcation scaling</span><strong>{bifurcationScale}%</strong><input type="range" min="0" max="100" step="5" value={bifurcationScale} onChange={event=>setBifurcationScale(Number(event.target.value))}/><small>Even spacing</small><small>Expanding gaps</small></label>
+      <label><span>Longitudinal smoothing</span><strong>{smoothing}%</strong><input type="range" min="0" max="100" step="2" value={smoothing} onChange={event=>setSmoothing(Number(event.target.value))}/><small>Exact section points</small><small>Fluid transition</small></label>
+      <label><span>Cage fidelity</span><strong>{fidelity}%</strong><input type="range" min="10" max="100" step="2" value={fidelity} onChange={event=>setFidelity(Number(event.target.value))}/><small>Simplified + smooth</small><small>Boundary accurate</small></label>
+    </div>
+    <div className="architectural-anchor-key"><span><i className="extent"/>Dominant perimeter</span><span><i className="ridge"/>Primary lines</span><span><i className="void"/>Offset lines</span><span><i className="ground"/>Scaled bifurcations</span></div>
+    <p>Each bifurcation belongs to its primary line, leaves and rejoins it at the shared ends, and scales progressively farther outward than the branch before it. The website's existing line colors remain unchanged.</p>
+    <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
+  </article>;
+}
+
+function BoundaryLinesPreview({slices,activeIndex,fidelity,setFidelity,primaryCount,setPrimaryCount,offsetsPerPrimary,setOffsetsPerPrimary,bifurcationsPerPrimary,setBifurcationsPerPrimary,bifurcationDistance,setBifurcationDistance,branchDirections,pointOffsets,setPointOffsets,smoothing,setSmoothing,position,onDragStart}:{slices:Slice[];activeIndex:number;fidelity:number;setFidelity:(value:number)=>void;primaryCount:number;setPrimaryCount:(value:number)=>void;offsetsPerPrimary:number;setOffsetsPerPrimary:(value:number)=>void;bifurcationsPerPrimary:number;setBifurcationsPerPrimary:(value:number)=>void;bifurcationDistance:number;setBifurcationDistance:(value:number)=>void;branchDirections:number[];pointOffsets:PointOffsets;setPointOffsets:React.Dispatch<React.SetStateAction<PointOffsets>>;smoothing:number;setSmoothing:(value:number)=>void;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+  const canvas=useRef<HTMLCanvasElement>(null);
+  const orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null);
+  const pan=useRef<{x:number;y:number;panX:number;panY:number}|null>(null);
+  const pointDrag=useRef<{axis:0|1|2;startX:number;startY:number;base:Vec;before:PointOffsets;screen:{x:number;y:number};worldPerPixel:number;scaleX:number;scaleY:number;key:string;live:Vec}|null>(null);
+  const gumballRef=useRef<{origin:{x:number;y:number};axes:{axis:0|1|2;end:{x:number;y:number}}[]} | null>(null);
+  const branchHitRef=useRef<{index:number;points:{x:number;y:number}[]}[]>([]);
+  const [camera,setCamera]=useState({yaw:-.68,pitch:.34,zoom:1,panX:0,panY:0});
+  const [ruledSurfaces,setRuledSurfaces]=useState(true);
+  const [selectedBranch,setSelectedBranch]=useState(0);
+  const [selectedPoint,setSelectedPoint]=useState(0);
+  const [expanded,setExpanded]=useState(false);
+  const [activeTool,setActiveTool]=useState<"select"|"pan"|"orbit">("select");
+  const [history,setHistory]=useState<{states:PointOffsets[];index:number}>({states:[{}],index:0});
+  const loops=useMemo(()=>slices.map(slice=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,fidelity))),[slices,fidelity]);
+  const families=useMemo(()=>longitudinalFamilies(slices,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,50,branchDirections,pointOffsets),[slices,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,branchDirections,pointOffsets]);
+  const pointCount=families.anchors.length;
+  useEffect(()=>{if(selectedBranch>=families.branches.length)setSelectedBranch(Math.max(0,families.branches.length-1));const length=families.branches[Math.min(selectedBranch,Math.max(0,families.branches.length-1))]?.length??0;if(selectedPoint>=length)setSelectedPoint(Math.max(0,length-1))},[families.branches,selectedBranch,selectedPoint]);
+  const cloneOffsets=(value:PointOffsets)=>Object.fromEntries(Object.entries(value).map(([key,offset])=>[key,[...offset] as Vec])) as PointOffsets;
+  const recordOffsets=(next:PointOffsets)=>setHistory(current=>{const base=current.states.slice(0,current.index+1),states=[...base,cloneOffsets(next)].slice(-11);return{states,index:states.length-1}});
+  const setPointAxis=(axis:0|1|2,value:number)=>{const key=`${selectedBranch}:${selectedPoint}`,offset=[...(pointOffsets[key]??[0,0,0])] as Vec;offset[axis]=value;const next={...pointOffsets,[key]:offset};setPointOffsets(next);recordOffsets(next)};
+  const undo=()=>setHistory(current=>{if(current.index<=0)return current;const index=current.index-1;setPointOffsets(cloneOffsets(current.states[index]));return{...current,index}});
+  const redo=()=>setHistory(current=>{if(current.index>=current.states.length-1)return current;const index=current.index+1;setPointOffsets(cloneOffsets(current.states[index]));return{...current,index}});
+  useEffect(()=>{if(!expanded)return;setHistory({states:[cloneOffsets(pointOffsets)],index:0});const close=(event:KeyboardEvent)=>{if(event.key==="Escape")setExpanded(false);if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==="z"){event.preventDefault();event.shiftKey?redo():undo()}if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==="y"){event.preventDefault();redo()}};const previous=document.body.style.overflow;document.body.style.overflow="hidden";window.addEventListener("keydown",close);return()=>{document.body.style.overflow=previous;window.removeEventListener("keydown",close)}},[expanded]);
+  useEffect(()=>{
+    const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;const width=c.width,height=c.height;
+    const background=ctx.createLinearGradient(0,0,0,height);background.addColorStop(0,"#111a1d");background.addColorStop(1,"#080d0f");ctx.fillStyle=background;ctx.fillRect(0,0,width,height);
+    if(!slices.length){ctx.fillStyle="#829da0";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select depth-map sections to trace",width/2,height/2);return}
     const zCenter=(slices[0].z+slices.at(-1)!.z)/2,rotate=([x,y,z]:Vec):Vec=>{z-=zCenter;const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]};
-    const project=(point:Vec)=>{const [x,y,z]=rotate(point),perspective=5/(5+z),scale=150*camera.zoom*perspective;return{x:width*.5+x*scale,y:height*.51-y*scale,z}};
+    const project=(point:Vec)=>{const [x,y,z]=rotate(point),depth=Math.max(1.2,6.4-z),focal=(expanded?Math.min(width,height)*2.25:920),scale=focal/depth*camera.zoom;return{x:width*.5+camera.panX+x*scale,y:height*.51+camera.panY-y*scale,z}};
     ctx.strokeStyle="rgba(67,98,103,.26)";ctx.lineWidth=.7;for(let i=-7;i<=7;i++){const a=project([i*.38,-1.03,zCenter-2.8]),b=project([i*.38,-1.03,zCenter+2.8]),d=project([-2.8,-1.03,zCenter+i*.38]),e=project([2.8,-1.03,zCenter+i*.38]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);ctx.stroke()}
     const rendered=loops.flatMap((section,index)=>section.map(loop=>({index,points:loop.map(([x,y])=>[(x/(W-1)-.5)*2.25,(.5-y/(H-1))*1.7,slices[index].z] as Vec)}))).map(item=>({...item,depth:item.points.reduce((sum,point)=>sum+rotate(point)[2],0)/Math.max(1,item.points.length)})).sort((a,b)=>b.depth-a.depth);
     // Transverse boundaries remain visible as a restrained reference cage.
     rendered.forEach(item=>{const active=item.index===activeIndex;ctx.strokeStyle=active?"rgba(155,235,224,.68)":"rgba(82,136,137,.22)";ctx.lineWidth=active?1.35:.62;ctx.beginPath();item.points.forEach((point,index)=>{const p=project(point);if(index===0)ctx.moveTo(p.x,p.y);else ctx.lineTo(p.x,p.y)});ctx.stroke()});
     if(ruledSurfaces)families.ruled.forEach(strip=>{const count=Math.min(strip.a.length,strip.b.length);for(let index=0;index<count-1;index++){const a=project(strip.a[index]),b=project(strip.b[index]),c=project(strip.b[index+1]),d=project(strip.a[index+1]);ctx.fillStyle=strip.kind==="void"?"rgba(255,181,91,.16)":"rgba(95,231,218,.12)";ctx.strokeStyle=strip.kind==="void"?"rgba(255,181,91,.24)":"rgba(95,231,218,.18)";ctx.lineWidth=.45;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(d.x,d.y);ctx.closePath();ctx.fill();ctx.stroke()}});
+    if(ruledSurfaces)families.branchPlates.forEach(strip=>{const count=Math.min(strip.a.length,strip.b.length);for(let index=0;index<count-1;index++){const a=project(strip.a[index]),b=project(strip.b[index]),c=project(strip.b[index+1]),d=project(strip.a[index+1]);ctx.fillStyle="rgba(242,151,72,.3)";ctx.strokeStyle="rgba(255,203,127,.7)";ctx.lineWidth=.55;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(d.x,d.y);ctx.closePath();ctx.fill();ctx.stroke()}});
     const drawFamily=(lines:Vec[][],color:string,widthValue:number,glow=0)=>lines.forEach(line=>{
       const points=line.map(project);if(points.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=widthValue;ctx.shadowColor=color;ctx.shadowBlur=glow;ctx.beginPath();ctx.moveTo(points[0].x,points[0].y);
       for(let i=1;i<points.length-1;i++){const midpoint={x:(points[i].x+points[i+1].x)/2,y:(points[i].y+points[i+1].y)/2};ctx.quadraticCurveTo(points[i].x,points[i].y,midpoint.x,midpoint.y)}
@@ -647,26 +812,69 @@ function BoundaryLinesPreview({slices,activeIndex,fidelity,setFidelity,position,
     });
     drawFamily(families.tweens,"rgba(118,153,166,.25)",.62);drawFamily(families.offset,"rgba(211,109,224,.54)",.85);
     families.primary.forEach((line,index)=>{const role=families.primaryRoles[index],color=role.startsWith("ground")?"rgba(114,203,255,.95)":role.startsWith("void")||role.startsWith("threshold")?"rgba(255,181,91,.96)":role==="ridge"?"rgba(255,110,207,.96)":"rgba(95,231,218,.92)";drawFamily([line],color,1.55,3)});
-    drawFamily(families.branches,"rgba(255,184,97,.85)",1.15,2);
+    branchHitRef.current=families.branches.map((line,index)=>({index,points:line.map(project)}));
+    families.branches.forEach((line,index)=>drawFamily([line],index===selectedBranch?"rgba(108,244,232,.98)":"rgba(255,184,97,.85)",index===selectedBranch?2.1:1.15,index===selectedBranch?5:2));
+    if(expanded)branchHitRef.current.forEach(branch=>branch.points.forEach((point,index)=>{const selected=branch.index===selectedBranch&&index===selectedPoint;ctx.fillStyle=selected?"#ffffff":"rgba(255,205,139,.88)";ctx.strokeStyle=selected?"#6cf4e8":"#513a20";ctx.lineWidth=selected?3:1.2;ctx.beginPath();ctx.arc(point.x,point.y,selected?7:3.5,0,Math.PI*2);ctx.fill();ctx.stroke()}));
+    const selectedWorld=families.branches[selectedBranch]?.[selectedPoint],selectedScreen=selectedWorld?project(selectedWorld):null;gumballRef.current=null;
+    if(expanded&&selectedWorld&&selectedScreen){const worldAxes:[0|1|2,Vec,string,string][]= [[0,[selectedWorld[0]+.42,selectedWorld[1],selectedWorld[2]],"#e96060","X"],[1,[selectedWorld[0],selectedWorld[1]+.42,selectedWorld[2]],"#65c878","Y"],[2,[selectedWorld[0],selectedWorld[1],selectedWorld[2]+.42],"#5f8ee8","Z"]],axes:{axis:0|1|2;end:{x:number;y:number}}[]=[];worldAxes.forEach(([axis,worldEnd,color,label])=>{const end=project(worldEnd),dx=end.x-selectedScreen.x,dy=end.y-selectedScreen.y,length=Math.max(1,Math.hypot(dx,dy)),ux=dx/length,uy=dy/length,px=-uy,py=ux;ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(selectedScreen.x,selectedScreen.y);ctx.lineTo(end.x,end.y);ctx.stroke();ctx.beginPath();ctx.moveTo(end.x,end.y);ctx.lineTo(end.x-ux*12+px*6,end.y-uy*12+py*6);ctx.lineTo(end.x-ux*12-px*6,end.y-uy*12-py*6);ctx.closePath();ctx.fill();ctx.font="bold 12px sans-serif";ctx.fillText(label,end.x+px*8,end.y+py*8);axes.push({axis,end})});ctx.fillStyle="#f5fbff";ctx.strokeStyle="#17323a";ctx.lineWidth=2;ctx.beginPath();ctx.arc(selectedScreen.x,selectedScreen.y,8,0,Math.PI*2);ctx.fill();ctx.stroke();gumballRef.current={origin:selectedScreen,axes}}
     families.anchors.forEach(({point,role})=>{const p=project(point);ctx.fillStyle=role.startsWith("ground")?"#8bd4ff":role.startsWith("void")||role.startsWith("threshold")?"#ffc16f":role==="ridge"?"#ff89d8":"#d7fff8";ctx.beginPath();ctx.arc(p.x,p.y,1.35,0,Math.PI*2);ctx.fill()});
     const axis=([color,end,label]:[string,Vec,string])=>{const o=project([0,-1.03,zCenter]),p=project(end);ctx.strokeStyle=color;ctx.lineWidth=1.3;ctx.beginPath();ctx.moveTo(o.x,o.y);ctx.lineTo(p.x,p.y);ctx.stroke();ctx.fillStyle=color;ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(label,p.x+4,p.y)};
     axis(["#dc6666",[.5,-1.03,zCenter],"X"]);axis(["#68bf78",[0,-.53,zCenter],"Z"]);axis(["#6b91d9",[0,-1.03,zCenter+.5],"Y"]);
     ctx.fillStyle="#739396";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`TRANSVERSE CAGE · SECTION ${activeIndex+1} / ${slices.length}`,14,20);ctx.textAlign="right";ctx.fillText(`${pointCount} EXTRACTED POINTS`,width-14,20);
-  },[slices,loops,families,activeIndex,pointCount,camera,ruledSurfaces]);
-  return <article className="boundary-lines-node" style={{left:position.x,top:position.y}}>
-    <header onPointerDown={onDragStart}><div className="model-icon"><ScanLine size={19}/></div><div><h2>Section Cage → Longitudinal Lines</h2><p>Extract points · primary guides · offsets · tweens · bifurcations</p></div><span>DRAG · CURVES</span></header>
-    <div className="boundary-viewport"><canvas ref={canvas} width={620} height={350} aria-label="Rotatable 3D preview of transverse section cages and longitudinal line families" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.68,pitch:.34,zoom:1})}>Reset view</button></div>
-    <div className="geometry-mode"><span>Geometry generation</span><div><button className={!ruledSurfaces?"active":""} onClick={()=>setRuledSurfaces(false)}>Ordered lines</button><button className={ruledSurfaces?"active":""} onClick={()=>setRuledSurfaces(true)}>Ruled surfaces</button></div><small>{families.ruled.length} valid strips · no random pairings</small></div>
-    <div className="boundary-fidelity line-method-controls">
-      <label><span>Ordered point rows</span><strong>{pointExtraction} / section</strong><input type="range" min="6" max="24" step="1" value={pointExtraction} onChange={event=>setPointExtraction(Number(event.target.value))}/><small>Essential rows</small><small>Dense cage reading</small></label>
-      <label><span>Primary-line offset</span><strong>{offsetAmount}%</strong><input type="range" min="0" max="100" step="2" value={offsetAmount} onChange={event=>setOffsetAmount(Number(event.target.value))}/><small>On the cage</small><small>Expanded family</small></label>
-      <label><span>Tween lines</span><strong>{tweenCount}</strong><input type="range" min="0" max="6" step="1" value={tweenCount} onChange={event=>setTweenCount(Number(event.target.value))}/><small>Primary only</small><small>Dense transitions</small></label>
-      <label><span>Bifurcation</span><strong>{bifurcation}%</strong><input type="range" min="0" max="100" step="2" value={bifurcation} onChange={event=>setBifurcation(Number(event.target.value))}/><small>Continuous guides</small><small>Branching flow</small></label>
-      <label><span>Cage fidelity</span><strong>{fidelity}%</strong><input type="range" min="10" max="100" step="2" value={fidelity} onChange={event=>setFidelity(Number(event.target.value))}/><small>Simplified + smooth</small><small>Boundary accurate</small></label>
+  },[slices,loops,families,activeIndex,pointCount,camera,ruledSurfaces,selectedBranch,selectedPoint,expanded]);
+  const selectedKey=`${selectedBranch}:${selectedPoint}`,selectedOffset=pointOffsets[selectedKey]??[0,0,0] as Vec;
+  const segmentDistance=(p:{x:number;y:number},a:{x:number;y:number},b:{x:number;y:number})=>{const dx=b.x-a.x,dy=b.y-a.y,length=dx*dx+dy*dy,t=length?Math.max(0,Math.min(1,((p.x-a.x)*dx+(p.y-a.y)*dy)/length)):0;return Math.hypot(p.x-(a.x+dx*t),p.y-(a.y+dy*t))};
+  const pointerDown=(event:React.PointerEvent<HTMLCanvasElement>)=>{
+    const rightOrbit=expanded&&event.button===2&&!event.shiftKey,rightPan=expanded&&event.button===2&&event.shiftKey,middlePan=expanded&&event.button===1;
+    if(rightPan||middlePan||(expanded&&activeTool==="pan"&&event.button===0)){event.currentTarget.setPointerCapture(event.pointerId);pan.current={x:event.clientX,y:event.clientY,panX:camera.panX,panY:camera.panY};return}
+    if(rightOrbit||(expanded&&activeTool==="orbit"&&event.button===0)){event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch};return}
+    const rect=event.currentTarget.getBoundingClientRect(),scaleX=event.currentTarget.width/rect.width,scaleY=event.currentTarget.height/rect.height,pointer={x:(event.clientX-rect.left)*scaleX,y:(event.clientY-rect.top)*scaleY};
+    if(expanded&&activeTool==="select"&&gumballRef.current){
+      const axis=gumballRef.current.axes.find(item=>segmentDistance(pointer,gumballRef.current!.origin,item.end)<15);
+      if(axis){const dx=axis.end.x-gumballRef.current.origin.x,dy=axis.end.y-gumballRef.current.origin.y,length=Math.max(1,Math.hypot(dx,dy)),base=[...selectedOffset] as Vec;event.currentTarget.setPointerCapture(event.pointerId);pointDrag.current={axis:axis.axis,startX:event.clientX,startY:event.clientY,base,before:cloneOffsets(pointOffsets),screen:{x:dx/length,y:dy/length},worldPerPixel:.42/length,scaleX,scaleY,key:selectedKey,live:base};return}
+    }
+    let best={branch:-1,point:-1,distance:expanded?14:10};branchHitRef.current.forEach(branch=>branch.points.forEach((point,index)=>{const distance=Math.hypot(point.x-pointer.x,point.y-pointer.y);if(distance<best.distance)best={branch:branch.index,point:index,distance}}));
+    if(best.branch>=0){setSelectedBranch(best.branch);setSelectedPoint(best.point);return}
+    event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch};
+  };
+  const pointerMove=(event:React.PointerEvent<HTMLCanvasElement>)=>{
+    const drag=pointDrag.current;if(drag){const dx=(event.clientX-drag.startX)*drag.scaleX,dy=(event.clientY-drag.startY)*drag.scaleY,amount=(dx*drag.screen.x+dy*drag.screen.y)*drag.worldPerPixel,next=[...drag.base] as Vec;next[drag.axis]=Math.max(-1.5,Math.min(1.5,drag.base[drag.axis]+amount));drag.live=next;setPointOffsets({...drag.before,[drag.key]:next});return}
+    const movingPan=pan.current;if(movingPan){setCamera(value=>({...value,panX:movingPan.panX+(event.clientX-movingPan.x),panY:movingPan.panY+(event.clientY-movingPan.y)}));return}
+    const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))};
+  const pointerEnd=()=>{const drag=pointDrag.current;if(drag){const next={...drag.before,[drag.key]:drag.live};setPointOffsets(next);recordOffsets(next)}orbit.current=null;pan.current=null;pointDrag.current=null};
+  return <article className={`boundary-lines-node ${expanded?"expanded":""}`} style={expanded?undefined:{left:position.x,top:position.y}} onDoubleClick={event=>{if(!(event.target as HTMLElement).closest("button,input"))setExpanded(true)}}>
+    <header onPointerDown={expanded?undefined:onDragStart}><div className="model-icon"><ScanLine size={19}/></div><div><h2>Unified Section Cage</h2><p>{expanded?"Perspective control-point editor":"Primary longitudinal lines · double-click to edit full screen"}</p></div>{expanded?<button className="close-cage-editor" onClick={()=>setExpanded(false)} aria-label="Close full-screen point editor"><XCircle size={18}/>Close editor</button>:<span>DRAG · DOUBLE-CLICK TO EDIT</span>}</header>
+    <div className="cage-workspace">
+      <aside className="cage-toolbar" aria-label="Modeling tools">
+        <button className={activeTool==="select"?"active":""} onClick={()=>setActiveTool("select")} title="Select and edit bifurcations"><MousePointer2/><span>Select</span></button>
+        <button className={activeTool==="pan"?"active":""} onClick={()=>setActiveTool("pan")} title="Pan the viewport"><Hand/><span>Pan</span></button>
+        <button className={activeTool==="orbit"?"active":""} onClick={()=>setActiveTool("orbit")} title="Orbit the viewport"><RotateCcw/><span>Orbit</span></button>
+        <div className="tool-divider"/>
+        <button onClick={undo} disabled={history.index<=0} title="Undo (Ctrl+Z)"><Undo2/><span>Undo</span></button>
+        <button onClick={redo} disabled={history.index>=history.states.length-1} title="Redo (Ctrl+Y)"><Redo2/><span>Redo</span></button>
+      </aside>
+      <div className={`boundary-viewport tool-${activeTool}`} onContextMenu={event=>event.preventDefault()}><canvas ref={canvas} width={expanded?1280:620} height={expanded?760:350} aria-label="Rhino-style perspective editor with selectable curve control points and three-axis translation gumball" onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerEnd} onPointerCancel={pointerEnd} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.35,Math.min(3,value.zoom-event.deltaY*.0012))}))}}/><span>{expanded?"Select a control point · drag the X, Y, or Z gumball axis · Right-drag: orbit · Shift + right-drag: pan":"Double-click to edit individual control points"}</span><div className="viewport-badge">Perspective</div><button onClick={()=>setCamera({yaw:-.68,pitch:.34,zoom:1,panX:0,panY:0})}>Zoom extents</button></div>
+      <aside className="cage-inspector">
+        {expanded&&<div className="inspector-heading"><strong>Properties</strong><span>History {history.index} / {Math.min(10,history.states.length-1)}</span></div>}
+        {expanded&&<div className="gumball-status"><div className="gumball-mini"><i className="gx"/><i className="gy"/><i className="gz"/></div><div><strong>Gumball · Point {families.branches.length?selectedPoint+1:"—"}</strong><span>Branch {families.branches.length?selectedBranch+1:"—"} · translate the selected point along X, Y, or Z.</span></div></div>}
+        <div className="geometry-mode"><span>Geometry generation</span><div><button className={!ruledSurfaces?"active":""} onClick={()=>setRuledSurfaces(false)}>Line hierarchy</button><button className={ruledSurfaces?"active":""} onClick={()=>setRuledSurfaces(true)}>Unified ruled skin</button></div><small>{families.primary.length} primary · {families.offset.length} offset · {families.branches.length} bifurcating lines</small></div>
+        <div className="boundary-fidelity line-method-controls">
+          <label><span>Primary lines</span><strong>{primaryCount}</strong><input type="range" min="3" max="12" step="1" value={primaryCount} onChange={event=>setPrimaryCount(Number(event.target.value))}/><small>Broad structure</small><small>Dense hierarchy</small></label>
+          <label><span>Offsets per primary line</span><strong>{offsetsPerPrimary}</strong><input type="range" min="0" max="6" step="1" value={offsetsPerPrimary} onChange={event=>setOffsetsPerPrimary(Number(event.target.value))}/><small>Primary only</small><small>6 offsets each</small></label>
+          <label><span>Bifurcations per primary line</span><strong>{bifurcationsPerPrimary}</strong><input type="range" min="0" max="4" step="1" value={bifurcationsPerPrimary} onChange={event=>setBifurcationsPerPrimary(Number(event.target.value))}/><small>No branching</small><small>4 controlled forks</small></label>
+          <label><span>Bifurcation distance</span><strong>{bifurcationDistance}%</strong><input type="range" min="10" max="100" step="5" value={bifurcationDistance} onChange={event=>setBifurcationDistance(Number(event.target.value))}/><small>Short threshold</small><small>Long traverse</small></label>
+          <label><span>Selected control point</span><strong>P{selectedPoint+1} · B{selectedBranch+1}</strong><input aria-label="Select control point on active branch" type="range" min="0" max={Math.max(0,(families.branches[selectedBranch]?.length??1)-1)} step="1" value={Math.min(selectedPoint,Math.max(0,(families.branches[selectedBranch]?.length??1)-1))} disabled={!families.branches.length} onChange={event=>setSelectedPoint(Number(event.target.value))}/><small>Click a point or use slider</small><small>{families.branches[selectedBranch]?.length??0} points</small></label>
+          <label><span>X translation</span><strong>{selectedOffset[0].toFixed(2)}</strong><input type="range" min="-1.5" max="1.5" step=".05" value={selectedOffset[0]} disabled={!families.branches.length} onChange={event=>setPointAxis(0,Number(event.target.value))}/><small>−X</small><small>+X</small></label>
+          <label><span>Y translation</span><strong>{selectedOffset[1].toFixed(2)}</strong><input type="range" min="-1.5" max="1.5" step=".05" value={selectedOffset[1]} disabled={!families.branches.length} onChange={event=>setPointAxis(1,Number(event.target.value))}/><small>−Y</small><small>+Y</small></label>
+          <label><span>Z translation</span><strong>{selectedOffset[2].toFixed(2)}</strong><input type="range" min="-1.5" max="1.5" step=".05" value={selectedOffset[2]} disabled={!families.branches.length} onChange={event=>setPointAxis(2,Number(event.target.value))}/><small>−Z</small><small>+Z</small></label>
+          <label><span>Longitudinal smoothing</span><strong>{smoothing}%</strong><input type="range" min="0" max="100" step="2" value={smoothing} onChange={event=>setSmoothing(Number(event.target.value))}/><small>Exact section points</small><small>Fluid transition</small></label>
+          <label><span>Cage fidelity</span><strong>{fidelity}%</strong><input type="range" min="10" max="100" step="2" value={fidelity} onChange={event=>setFidelity(Number(event.target.value))}/><small>Simplified + smooth</small><small>Boundary accurate</small></label>
+        </div>
+        <div className="architectural-anchor-key" aria-label="Primary and offset line logic"><span><i className="extent"/>Dominant perimeter</span><span><i className="ridge"/>Primary lines</span><span><i className="void"/>Offset lines</span><span><i className="ground"/>Shared section order</span></div>
+        <p>{expanded?"Every orange control point is selectable. The red, green, and blue gumball arrows translate the active point along world X, Y, and Z; the adjacent curve and floor plate rebuild around that edited point. Ctrl+Z and Ctrl+Y move through the last ten point translations.":"Double-click this component to open the full-screen cage editor and translate individual curve points in a standard perspective viewport."}</p>
+      </aside>
     </div>
-    <div className="architectural-anchor-key" aria-label="Architectural point classifications"><span><i className="ridge"/>Ridge</span><span><i className="ground"/>Ground contact</span><span><i className="extent"/>Extent / inflection</span><span><i className="void"/>Void edge / threshold</span></div>
-    <p>The transverse CT boundaries act as a reference cage. Ridge, ground, extent, void, threshold, and inflection points are assigned consistent roles and ordered left-to-right on every section. Only points that continue through the sequence are shown, forming clean longitudinal rows before offsets, tweens, and bifurcations are added.</p>
-    <span className="port port-top" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/><span className="port port-bottom port-chunk-out" aria-hidden="true"/>
+    <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
   </article>;
 }
 
@@ -687,11 +895,11 @@ function GridRationalizationPreview({slices,gridSize,alignment,setGridSize,setAl
     ctx.fillStyle="#83aeb2";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`GRID ${gridSize} CELLS · ALIGNMENT ${alignment}%`,14,20);
   },[slices,loops,gridSize,alignment,camera]);
   return <article className="grid-rationalization-node" style={{left:position.x,top:position.y}}>
-    <header onPointerDown={onDragStart}><div className="model-icon"><Grid3X3 size={19}/></div><div><h2>Grid Rationalization</h2><p>Ordered section geometry · seamless curve alignment</p></div><span>DRAG · GRID</span></header>
+    <header onPointerDown={onDragStart}><div className="model-icon"><Grid3X3 size={19}/></div><div><h2>Grid Rationalization</h2><p>CT volume → ordered section framework</p></div><span>DRAG · GRID</span></header>
     <div className="grid-viewport"><canvas ref={canvas} width={620} height={350} aria-label="Rotatable 3D preview of grid-aligned section curves" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.72,pitch:.38,zoom:1})}>Reset view</button></div>
     <div className="grid-controls"><label><span>Grid spacing</span><strong>{gridSize} cells</strong><input type="range" min="4" max="16" step="1" value={gridSize} onChange={event=>setGridSize(Number(event.target.value))}/><small>Fine order</small><small>Broad modules</small></label><label><span>Grid alignment</span><strong>{alignment}%</strong><input type="range" min="0" max="100" step="2" value={alignment} onChange={event=>setAlignment(Number(event.target.value))}/><small>Original curves</small><small>Orthogonal order</small></label></div>
-    <p>Exterior and void boundaries are pulled toward one shared grid, then relaxed so adjacent sections blend continuously. The aligned result drives the SubD preview, clipping section, and Rhino exports.</p>
-    <span className="port port-left" aria-hidden="true"/><span className="port port-bottom" aria-hidden="true"/>
+    <p>Exterior and void boundaries are pulled toward one shared grid, then relaxed so adjacent sections blend continuously. This rationalized geometry now feeds the Unified Section Cage before its primary and offset lines generate the ruled mesh.</p>
+    <span className="port port-left port-ct-in" aria-hidden="true"/><span className="port port-right port-cage-out" aria-hidden="true"/>
   </article>;
 }
 
@@ -772,13 +980,14 @@ function ExportGeometryPreview({slices,exportHeight,position,onDragStart}:{slice
   return <article className="subd-preview-node" style={{left:position.x,top:position.y}}>
     <header onPointerDown={onDragStart}><div className="model-icon"><Sparkles size={19}/></div><div><h2>Baked Rhino Geometry Preview</h2><p>All exported layers · combined Rhino viewport</p></div><span>DRAG · LIVE</span></header>
     <div className="subd-viewport"><canvas ref={canvas} width={500} height={360} aria-label="Interactive preview showing the watertight mesh, all section surfaces, and all boundary curves baked together in Rhino. Drag to orbit and use the mouse wheel to zoom." onPointerDown={e=>{e.currentTarget.setPointerCapture(e.pointerId);orbit.current={x:e.clientX,y:e.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={e=>{const start=orbit.current;if(start)setCamera(v=>({...v,yaw:start.yaw+(e.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(e.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={e=>{e.preventDefault();setCamera(v=>({...v,zoom:Math.max(.55,Math.min(2.2,v.zoom-e.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.72,pitch:.38,zoom:1})}>Reset view</button></div>
+    <div className="spatial-constraint-band compact"><strong>20′ × 20′</strong><span>{exportHeight/12}′ high</span><span>1 floor</span><span>Trimmed</span></div>
     <div className="baked-layer-controls"><button className={layers.mesh?"active":""} onClick={()=>toggleLayer("mesh")} aria-pressed={layers.mesh}><i className="mesh"/>Printable SubD mesh</button><button className={layers.sections?"active":""} onClick={()=>toggleLayer("sections")} aria-pressed={layers.sections}><i className="sections"/>Section surfaces</button><button className={layers.boundaries?"active":""} onClick={()=>toggleLayer("boundaries")} aria-pressed={layers.boundaries}><i className="boundaries"/>Boundary curves</button></div>
-    <div className="subd-preview-meta"><span>RHINO LAYERS 01–03 · ALL GEOMETRY BAKED</span><strong>Composite export preview</strong><p>The shaded watertight form, every independent section surface, and all exterior and void boundary curves are displayed together at the exported 20″ × 20″ × {exportHeight}″ scale.</p></div>
-    <span className="port port-top" aria-hidden="true"/>
+    <div className="subd-preview-meta"><span>RHINO LAYERS 01–03 · ALL GEOMETRY BAKED</span><strong>Composite export preview</strong><p>The single-floor ruled form, reference sections, and boundary curves are displayed inside the 20′ × 20′ × {exportHeight/12}′ envelope; geometry beyond it is removed.</p></div>
+    <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
   </article>;
 }
 
-function FrontClipPreview({slices,position,onDragStart}:{slices:Slice[];position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+function FrontClipPreview({slices,heightInches,position,onDragStart}:{slices:Slice[];heightInches:number;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
   const canvas=useRef<HTMLCanvasElement>(null);
   const [clip,setClip]=useState(50);
   const clipIndex=Math.round(clip/100*Math.max(0,slices.length-1));
@@ -812,26 +1021,27 @@ function FrontClipPreview({slices,position,onDragStart}:{slices:Slice[];position
   return <article className="clip-preview-node" style={{left:position.x,top:position.y}}>
     <header onPointerDown={onDragStart}><div className="model-icon"><ScanLine size={18}/></div><div><h2>SubD Section Cut</h2><p>Front orthographic · section from smoothed massing</p></div><span>DRAG · CLIP</span></header>
     <canvas ref={canvas} width={430} height={300} aria-label="Front orthographic view with movable clipping plane"/>
+    <div className="spatial-constraint-band compact"><strong>20′ × 20′</strong><span>{heightInches/12}′ high</span><span>1 floor</span><span>Trimmed</span></div>
     <div className="clip-control"><label><span>Clipping plane</span><strong>{clip}%</strong><input type="range" min="0" max="100" step="1" value={clip} onChange={e=>setClip(Number(e.target.value))}/><small>Front section</small><small>Back section</small></label></div>
     <p className="clip-note">The filled cut is sampled directly from the smoothed SubD field. Move the plane through the massing; orange lines retain its internal void boundaries.</p>
-    <span className="port port-top" aria-hidden="true"/>
+    <span className="port port-left" aria-hidden="true"/>
   </article>;
 }
 
-function ExportNode({slices,lineFidelity,exportHeight,setExportHeight,position,onDragStart}:{slices:Slice[];lineFidelity:number;exportHeight:number;setExportHeight:(value:number)=>void;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+function ExportNode({slices,lineFidelity,primaryCount,offsetsPerPrimary,exportHeight,setExportHeight,position,onDragStart}:{slices:Slice[];lineFidelity:number;primaryCount:number;offsetsPerPrimary:number;exportHeight:number;setExportHeight:(value:number)=>void;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
   const [version,setVersion]=useState<7|8>(8),[busy,setBusy]=useState(false);
-  const run=async()=>{setBusy(true);try{await exportRhinoBundle(slices,version,lineFidelity,exportHeight)}finally{setBusy(false)}};
+  const run=async()=>{setBusy(true);try{await exportRhinoBundle(slices,version,lineFidelity,exportHeight,primaryCount,offsetsPerPrimary)}finally{setBusy(false)}};
   return <article className="export-node" style={{left:position.x,top:position.y}}>
     <header onPointerDown={onDragStart}><div className="model-icon"><Download size={19}/></div><div><h2>Rhino Export</h2><p>One coordinated file · three editable geometry layers</p></div><span>DRAG · 3DM</span></header>
     <div className="rhino-version"><span>File version</span><div role="group" aria-label="Rhino file version"><button className={version===7?"active":""} onClick={()=>setVersion(7)}>Rhino 7</button><button className={version===8?"active":""} onClick={()=>setVersion(8)}>Rhino 8</button></div><small>Imperial model units: inches · layout units: feet.</small></div>
-    <div className="export-scale"><div><span>Tile footprint</span><strong>20″ × 20″</strong><small>1′-8″ × 1′-8″ maximum envelope</small></div><label><span>Overall height</span><strong>{exportHeight}″ <small>({Math.floor(exportHeight/12)}′-{exportHeight%12}″)</small></strong><input type="range" min="1" max="36" step="1" value={exportHeight} onChange={event=>setExportHeight(Number(event.target.value))}/><small>1″</small><small>36″ / 3′-0″</small></label></div>
+    <div className="export-scale"><div><span>Maximum footprint</span><strong>20′ × 20′</strong><small>240″ × 240″ architectural envelope</small></div><label><span>Overall height</span><strong>{exportHeight/12}′ <small>({exportHeight}″)</small></strong><input type="range" min="96" max="240" step="12" value={exportHeight} onChange={event=>setExportHeight(Number(event.target.value))}/><small>8′</small><small>20′</small></label></div>
     <div className="export-options export-bundle">
-      <section><Box size={22}/><div><strong>01 · Printable SubD Form</strong><p>Shared-vertex watertight mesh with sealed exterior and void walls, ready for 3D-print preparation.</p></div></section>
+      <section><Box size={22}/><div><strong>01 · Unified Printable Form</strong><p>One single-floor watertight mesh inside the 20′ × 20′ envelope, organized by {primaryCount} primary lines and {offsetsPerPrimary} offsets per primary.</p></div></section>
       <section><ScanLine size={22}/><div><strong>02 · Section Surfaces</strong><p>Every CT section remains an independent named surface on its own Rhino layer.</p></div></section>
       <section><ScanLine size={22}/><div><strong>03 · Boundary Lines</strong><p>Editable exterior and void curves exported at {lineFidelity}% fidelity.</p></div></section>
     </div>
-    <div className="export-secondary export-all"><span>{slices.length} sections · 20″ × 20″ × {exportHeight}″ · one Rhino file</span><button onClick={()=>void run()} disabled={!slices.length||busy}><Download size={14}/>{busy?"Building complete package…":`Export all 3 · R${version}`}</button></div>
-    <span className="port port-top port-grid-in" aria-hidden="true"/><span className="port port-bottom port-preview-out" aria-hidden="true"/><span className="port port-bottom port-clip-out" aria-hidden="true"/>
+    <div className="export-secondary export-all"><span>{slices.length} sections · one floor · max 20′ × 20′ × {exportHeight/12}′ · outside geometry trimmed</span><button onClick={()=>void run()} disabled={!slices.length||busy}><Download size={14}/>{busy?"Building complete package…":`Export all 3 · R${version}`}</button></div>
+    <span className="port port-left port-mesh-in" aria-hidden="true"/><span className="port port-right port-preview-out" aria-hidden="true"/>
   </article>;
 }
 
@@ -839,11 +1049,12 @@ export default function PhotoModel({images,position,onDragStart}:{images:StoredI
   const [selected,setSelected]=useState<string[]>([]);
   const [fields,setFields]=useState<Float32Array[]>([]),[busy,setBusy]=useState(true);
   const [interval,setInterval]=useState(.68),[elongation,setElongation]=useState(165),[continuity,setContinuity]=useState(72),[scan,setScan]=useState(50),[density,setDensity]=useState(42),[depthGain,setDepthGain]=useState(68),[voidTransform,setVoidTransform]=useState(0);
-  const [angle,setAngle]=useState(.62),[tilt,setTilt]=useState(.3),[lineFidelity,setLineFidelity]=useState(76),[gridSize,setGridSize]=useState(8),[gridAlignment,setGridAlignment]=useState(64),[exportHeight,setExportHeight]=useState(8);
+  const [angle,setAngle]=useState(.62),[tilt,setTilt]=useState(.3),[lineFidelity,setLineFidelity]=useState(76),[primaryLineCount,setPrimaryLineCount]=useState(5),[offsetsPerPrimary,setOffsetsPerPrimary]=useState(2),[bifurcationsPerPrimary,setBifurcationsPerPrimary]=useState(3),[bifurcationDistance,setBifurcationDistance]=useState(65),[bifurcationScale,setBifurcationScale]=useState(60),[primarySmoothing,setPrimarySmoothing]=useState(72),[gridSize,setGridSize]=useState(8),[gridAlignment,setGridAlignment]=useState(64),[exportHeight,setExportHeight]=useState(144);
+  const [circulationSettings,setCirculationSettings]=useState<CirculationSettings>({primaryCount:2,pathWidth:5.5,activeBranches:2,junctionWidth:55,smoothing:70}),[floorPlateSettings,setFloorPlateSettings]=useState<FloorPlateSettings>({noiseReduction:72,plateThickness:10,surfaceFlow:82});
   const [realitySettings,setRealitySettings]=useState<RealitySettings>({supportSpacing:24,clearance:6,maxSlope:12});
   const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;a:number;t:number}|null>(null);
-  type ChildNode="reality"|"preview"|"clip"|"export"|"boundary"|"grid"|"chunk";
-  const [nodePositions,setNodePositions]=useState<Record<ChildNode,{x:number;y:number}>>(()=>({reality:{x:position.x+760,y:position.y+160},boundary:{x:position.x,y:position.y+1160},grid:{x:position.x+760,y:position.y+1160},chunk:{x:position.x,y:position.y+2070},export:{x:position.x+760,y:position.y+1840},preview:{x:position.x+760,y:position.y+2520},clip:{x:position.x+1300,y:position.y+2520}}));
+  type ChildNode="reality"|"preview"|"clip"|"export"|"boundary"|"grid"|"circulation"|"framework"|"floor"|"mesh";
+  const [nodePositions,setNodePositions]=useState<Record<ChildNode,{x:number;y:number}>>(()=>({grid:{x:position.x+760,y:position.y},boundary:{x:position.x+1520,y:position.y},circulation:{x:position.x+2280,y:position.y},framework:{x:position.x+3060,y:position.y},floor:{x:position.x+3820,y:position.y},mesh:{x:position.x+4660,y:position.y},export:{x:position.x+5500,y:position.y},preview:{x:position.x+6500,y:position.y},clip:{x:position.x+7080,y:position.y},reality:{x:position.x+760,y:position.y+900}}));
   const nodeDrag=useRef<{node:ChildNode;startX:number;startY:number;origin:{x:number;y:number}}|null>(null);
   useEffect(()=>{
     const move=(event:PointerEvent)=>{const active=nodeDrag.current;if(!active)return;setNodePositions(current=>({...current,[active.node]:{x:Math.max(12,active.origin.x+event.clientX-active.startX),y:Math.max(20,active.origin.y+event.clientY-active.startY)}}))};
@@ -863,8 +1074,8 @@ export default function PhotoModel({images,position,onDragStart}:{images:StoredI
   },[selected,depthGain]);
   const transformedFields=useMemo(()=>fields.map(field=>transformVoids(field,voidTransform)),[fields,voidTransform]);
   const slices=useMemo(()=>interpolate(transformedFields,interval*elongation/100,continuity),[transformedFields,interval,elongation,continuity]);
-  const groundedSlices=useMemo(()=>rationalizeSlices(slices,realitySettings),[slices,realitySettings]);
-  const gridSlices=useMemo(()=>gridAlignSlices(groundedSlices,gridSize,gridAlignment),[groundedSlices,gridSize,gridAlignment]);
+  const groundedSlices=useMemo(()=>rationalizeSlices(slices,realitySettings).map(slice=>({...slice,field:keepLargestConnectedField(slice.field)})),[slices,realitySettings]);
+  const gridSlices=useMemo(()=>gridAlignSlices(slices,gridSize,gridAlignment).map(slice=>({...slice,field:keepLargestConnectedField(slice.field)})),[slices,gridSize,gridAlignment]);
   const scanIndex=Math.round(scan/100*Math.max(0,slices.length-1));
   useEffect(()=>{
     const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;
@@ -900,18 +1111,23 @@ export default function PhotoModel({images,position,onDragStart}:{images:StoredI
   const exportPosition=nodePositions.export;
   const boundaryPosition=nodePositions.boundary;
   const gridPosition=nodePositions.grid;
-  const chunkPosition=nodePositions.chunk;
+  const circulationPosition=nodePositions.circulation;
+  const frameworkPosition=nodePositions.framework;
+  const floorPosition=nodePositions.floor;
+  const meshPosition=nodePositions.mesh;
   const horizontalWire=(start:{x:number;y:number},end:{x:number;y:number})=>`M ${start.x} ${start.y} C ${start.x+(end.x-start.x)*.48} ${start.y}, ${end.x-(end.x-start.x)*.48} ${end.y}, ${end.x} ${end.y}`;
   const verticalWire=(start:{x:number;y:number},end:{x:number;y:number})=>`M ${start.x} ${start.y} C ${start.x} ${start.y+(end.y-start.y)*.48}, ${end.x} ${end.y-(end.y-start.y)*.48}, ${end.x} ${end.y}`;
   return <>
     <svg className="workflow-wires" aria-hidden="true">
-      <path d={horizontalWire({x:position.x+620,y:position.y+285},{x:realityPosition.x,y:realityPosition.y+285})}/>
-      <path d={verticalWire({x:position.x+310,y:position.y+1040},{x:boundaryPosition.x+310,y:boundaryPosition.y})}/>
-      <path d={horizontalWire({x:boundaryPosition.x+620,y:boundaryPosition.y+286},{x:gridPosition.x,y:gridPosition.y+286})}/>
-      <path d={verticalWire({x:boundaryPosition.x+310,y:boundaryPosition.y+790},{x:chunkPosition.x+380,y:chunkPosition.y})}/>
-      <path d={verticalWire({x:gridPosition.x+310,y:gridPosition.y+545},{x:exportPosition.x+490,y:exportPosition.y})}/>
-      <path d={verticalWire({x:exportPosition.x+325,y:exportPosition.y+465},{x:previewPosition.x+250,y:previewPosition.y})}/>
-      <path d={verticalWire({x:exportPosition.x+655,y:exportPosition.y+465},{x:clipPosition.x+215,y:clipPosition.y})}/>
+      <path d={horizontalWire({x:position.x+620,y:position.y+286},{x:gridPosition.x,y:gridPosition.y+286})}/>
+      <path d={horizontalWire({x:gridPosition.x+620,y:gridPosition.y+286},{x:boundaryPosition.x,y:boundaryPosition.y+286})}/>
+      <path d={horizontalWire({x:boundaryPosition.x+620,y:boundaryPosition.y+286},{x:circulationPosition.x,y:circulationPosition.y+286})}/>
+      <path d={horizontalWire({x:circulationPosition.x+700,y:circulationPosition.y+286},{x:frameworkPosition.x,y:frameworkPosition.y+286})}/>
+      <path d={horizontalWire({x:frameworkPosition.x+700,y:frameworkPosition.y+286},{x:floorPosition.x,y:floorPosition.y+286})}/>
+      <path d={horizontalWire({x:floorPosition.x+760,y:floorPosition.y+286},{x:meshPosition.x,y:meshPosition.y+286})}/>
+      <path d={horizontalWire({x:meshPosition.x+760,y:meshPosition.y+286},{x:exportPosition.x,y:exportPosition.y+286})}/>
+      <path d={horizontalWire({x:exportPosition.x+980,y:exportPosition.y+286},{x:previewPosition.x,y:previewPosition.y+287})}/>
+      <path d={horizontalWire({x:previewPosition.x+500,y:previewPosition.y+287},{x:clipPosition.x,y:clipPosition.y+285})}/>
     </svg>
     <article className="model-node ct-node" data-node="model" style={{left:position.x,top:position.y}}>
     <header onPointerDown={onDragStart}><div className="model-icon"><ScanLine size={21}/></div><div><h2>Depth Maps → CT Volume</h2><p>Cubic depth blending · continuous massing</p></div><span>DRAG</span></header>
@@ -919,14 +1135,17 @@ export default function PhotoModel({images,position,onDragStart}:{images:StoredI
     <div className="ct-controls"><label>Scan position <strong>{scan}%</strong><input type="range" min="0" max="100" value={scan} onChange={e=>setScan(Number(e.target.value))}/></label><label>Volume density <strong>{density}%</strong><input type="range" min="10" max="100" value={density} onChange={e=>setDensity(Number(e.target.value))}/></label><label className="depth-gain">Depth separation <strong>{depthGain}%</strong><input type="range" min="10" max="100" value={depthGain} onChange={e=>setDepthGain(Number(e.target.value))}/></label><label className="massing-shape">Massing elongation <strong>{elongation}%</strong><input type="range" min="75" max="350" step="5" value={elongation} onChange={e=>setElongation(Number(e.target.value))}/><span className="range-ends"><i>Compact</i><i>Elongated</i></span></label><label className="massing-shape">Surface continuity <strong>{continuity}%</strong><input type="range" min="0" max="100" step="2" value={continuity} onChange={e=>setContinuity(Number(e.target.value))}/><span className="range-ends"><i>Sectional</i><i>Smooth + curved</i></span></label><label className="void-transform">Void / open-area transform <strong>{voidTransform===0?"Unchanged":voidTransform>0?`Expand +${voidTransform}%`:`Compress ${Math.abs(voidTransform)}%`}</strong><input type="range" min="-100" max="100" step="5" value={voidTransform} onChange={e=>setVoidTransform(Number(e.target.value))}/><span className="range-ends"><i>Compress openings</i><i>Expand openings</i></span></label></div>
     <div className="model-controls"><label>Slice interval <input type="range" min=".4" max="1.2" step=".02" value={interval} onChange={e=>setInterval(Number(e.target.value))}/></label><span className="export-routed">Exports routed to the connected Rhino component</span></div>
     <div className="model-sources"><div className="model-caption"><strong>Imported depth sequence</strong><div><span>{selected.length} of {images.length} slices</span><button className="reset-selection" onClick={deselectSelection} disabled={!selected.length} title="Deselect every image from the CT sequence"><XCircle size={13}/>Deselect selection</button></div></div><div className="model-thumbs">{images.map(image=><button key={image.key} className={selected.includes(image.key)?"active":""} onClick={()=>toggle(image.key)} aria-pressed={selected.includes(image.key)} title={image.name}><img src={source(image.key)} alt=""/><span>{image.name}</span></button>)}</div>{!images.length&&<div className="depth-empty">Import images in Image Storage to build the CT sequence.</div>}</div>
-    <p className="model-note">Each photo is read as a depth map with perimeter-aware cavity detection. Reality Constraints turns the CT result into one grounded, structurally supported occupiable floor with connected void thresholds—not an entire building.</p><span className="port port-left port-storage-in" aria-hidden="true"/><span className="port port-right port-reality-out" aria-hidden="true"/><span className="port port-bottom port-boundary-out" aria-hidden="true"/>
+    <p className="model-note">Each photo is read as a depth map with perimeter-aware cavity detection. The CT result is sent horizontally to Grid Rationalization, establishing the ordered framework that the Unified Section Cage uses to generate primary, offset, and bifurcating lines.</p><span className="port port-left port-storage-in" aria-hidden="true"/><span className="port port-right port-grid-out" aria-hidden="true"/>
     </article>
     <RealityNode slices={groundedSlices} settings={realitySettings} setSettings={setRealitySettings} position={realityPosition} onDragStart={startChildDrag("reality")}/>
     <ExportGeometryPreview slices={gridSlices} exportHeight={exportHeight} position={previewPosition} onDragStart={startChildDrag("preview")}/>
-    <FrontClipPreview slices={gridSlices} position={clipPosition} onDragStart={startChildDrag("clip")}/>
-    <BoundaryLinesPreview slices={groundedSlices} activeIndex={scanIndex} fidelity={lineFidelity} setFidelity={setLineFidelity} position={boundaryPosition} onDragStart={startChildDrag("boundary")}/>
-    <SpatialChunkPreview slices={groundedSlices} position={chunkPosition} onDragStart={startChildDrag("chunk")}/>
+    <FrontClipPreview slices={gridSlices} heightInches={exportHeight} position={clipPosition} onDragStart={startChildDrag("clip")}/>
     <GridRationalizationPreview slices={gridSlices} gridSize={gridSize} alignment={gridAlignment} setGridSize={setGridSize} setAlignment={setGridAlignment} position={gridPosition} onDragStart={startChildDrag("grid")}/>
-    <ExportNode slices={gridSlices} lineFidelity={lineFidelity} exportHeight={exportHeight} setExportHeight={setExportHeight} position={exportPosition} onDragStart={startChildDrag("export")}/>
+    <ReadOnlyBoundaryLinesPreview slices={gridSlices} activeIndex={scanIndex} fidelity={lineFidelity} setFidelity={setLineFidelity} primaryCount={primaryLineCount} setPrimaryCount={setPrimaryLineCount} offsetsPerPrimary={offsetsPerPrimary} setOffsetsPerPrimary={setOffsetsPerPrimary} bifurcationsPerPrimary={bifurcationsPerPrimary} setBifurcationsPerPrimary={setBifurcationsPerPrimary} bifurcationDistance={bifurcationDistance} setBifurcationDistance={setBifurcationDistance} bifurcationScale={bifurcationScale} setBifurcationScale={setBifurcationScale} smoothing={primarySmoothing} setSmoothing={setPrimarySmoothing} position={boundaryPosition} onDragStart={startChildDrag("boundary")}/>
+    <CirculationPreview slices={gridSlices} fidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} bifurcationsPerPrimary={bifurcationsPerPrimary} bifurcationDistance={bifurcationDistance} bifurcationScale={bifurcationScale} smoothing={primarySmoothing} settings={circulationSettings} setSettings={setCirculationSettings} heightInches={exportHeight} setHeightInches={setExportHeight} position={circulationPosition} onDragStart={startChildDrag("circulation")}/>
+    <CageCirculationPreview slices={gridSlices} fidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} bifurcationsPerPrimary={bifurcationsPerPrimary} bifurcationDistance={bifurcationDistance} bifurcationScale={bifurcationScale} smoothing={primarySmoothing} circulationSettings={circulationSettings} heightInches={exportHeight} position={frameworkPosition} onDragStart={startChildDrag("framework")}/>
+    <UnifiedFloorPlatePreview slices={gridSlices} fidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} bifurcationsPerPrimary={bifurcationsPerPrimary} bifurcationDistance={bifurcationDistance} bifurcationScale={bifurcationScale} smoothing={primarySmoothing} circulationSettings={circulationSettings} settings={floorPlateSettings} setSettings={setFloorPlateSettings} heightInches={exportHeight} position={floorPosition} onDragStart={startChildDrag("floor")}/>
+    <UnifiedRuledMeshPreview slices={gridSlices} fidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} bifurcationsPerPrimary={bifurcationsPerPrimary} bifurcationDistance={bifurcationDistance} bifurcationScale={bifurcationScale} smoothing={primarySmoothing} circulationSettings={circulationSettings} floorSettings={floorPlateSettings} heightInches={exportHeight} position={meshPosition} onDragStart={startChildDrag("mesh")}/>
+    <ExportNode slices={gridSlices} lineFidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} exportHeight={exportHeight} setExportHeight={setExportHeight} position={exportPosition} onDragStart={startChildDrag("export")}/>
   </>;
 }
