@@ -1,14 +1,21 @@
 "use client";
+import { analyzeLoft, rankTypologies, recommendSpace, psychologicalIntent } from "./space-analysis";
+import { ModelGif } from "./gif-export";
+import { illustratorSheet } from "./illustrator-sheet";
+import { waterfall } from "./waterfall";
+import { createLoftRenderer, loftDisplayMesh, type LoftModel, type LoftCamera } from "./loft-renderer";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Download, Grid3X3, Hand, Layers3, MousePointer2, Redo2, RotateCcw, Route, ScanLine, Sparkles, Undo2, XCircle } from "lucide-react";
 
-type StoredImage={key:string;name:string;size:number;uploadedAt:string};
+type StoredImage={key:string;name:string;size:number;uploadedAt:string;folder?:"existing"|"new"};
 const source=(key:string)=>`/api/images/content?key=${encodeURIComponent(key)}`;
 const W=64,H=48,steps=8;
 type Slice={field:Float32Array;z:number;image:HTMLCanvasElement};
 type Vec=[number,number,number];
 type RealitySettings={supportSpacing:number;clearance:number;maxSlope:number};
+const VIEWPORT_PRIMARY="#1ec1f2",VIEWPORT_SECONDARY="#dc24f4",VIEWPORT_TERTIARY="#ff5284";
+const viewportColor=(level:"primary"|"secondary"|"tertiary",alpha=1)=>{const rgb=level==="primary"?"30,193,242":level==="secondary"?"220,36,244":"255,82,132";return `rgba(${rgb},${alpha})`};
 
 function fieldFromImage(data:Uint8ClampedArray,depthGain:number){
   const raw=new Float32Array(W*H),result=new Float32Array(W*H),values:number[]=[];
@@ -294,13 +301,13 @@ async function exportRhinoSubd(slices:Slice[],version:7|8){
   mesh.setUserString("Form","Multi-boundary photo-derived CT SubD");
   mesh.setUserString("RhinoWorkflow","Quad boundary loft preserving internal void bands. Run ToSubD with Creases=No.");
   mesh.setUserString("SourceSections",String(slices.length));
-  const file=new rhino.File3dm();file.applicationName="Section Forge";file.applicationDetails=`Photo to CT Volume · Rhino ${version} SubD massing export`;
+  const file=new rhino.File3dm();file.applicationName="Sand Scan";file.applicationDetails=`Photo to CT Volume · Rhino ${version} SubD massing export`;
   file.startSectionComments=`Editable multi-boundary CT loft written for Rhino ${version}. Outer and internal section boundaries are preserved as quad surfaces. Select CT_SUBD_MASSING and run ToSubD with Creases=No.`;
   const layerIndex=file.layers().addLayer("CT_SUBD_MASSING",{r:124,g:205,b:194,a:255});
   const attributes=new rhino.ObjectAttributes();attributes.name="CT_SUBD_MASSING";attributes.layerIndex=layerIndex;
   attributes.setUserString("NextCommand","_ToSubD _Creases=_No");
   file.objects().addMesh(mesh,attributes);
-  downloadRhinoFile(file,rhino,version,`section-forge-subd-rhino${version}.3dm`);
+  downloadRhinoFile(file,rhino,version,`sand-scan-subd-rhino${version}.3dm`);
   attributes.delete();mesh.delete();file.delete();
 }
 
@@ -308,7 +315,7 @@ async function exportRhinoSections(slices:Slice[],version:7|8){
   if(!slices.length)return;
   const [{default:rhino3dm},{default:wasmUrl}]=await Promise.all([import("rhino3dm"),import("rhino3dm/rhino3dm.wasm?url")]);
   const rhino=await rhino3dm({locateFile:()=>wasmUrl}),file=new rhino.File3dm();
-  file.applicationName="Section Forge";file.applicationDetails=`CT section surfaces · Rhino ${version}`;
+  file.applicationName="Sand Scan";file.applicationDetails=`CT section surfaces · Rhino ${version}`;
   file.startSectionComments=`Individual planar section surfaces written for Rhino ${version}. Each named mesh remains independent; open cells preserve the detected voids.`;
   const layerIndex=file.layers().addLayer("CT_SECTION_SURFACES",{r:242,g:105,b:82,a:255}),nx=48,ny=36,threshold=.32;
   slices.forEach((slice,index)=>{
@@ -321,7 +328,7 @@ async function exportRhinoSections(slices:Slice[],version:7|8){
     mesh.normals().computeNormals();mesh.setUserString("GeometryType","Independent CT section surface");mesh.setUserString("SectionIndex",String(index+1));mesh.setUserString("Depth",slice.z.toFixed(5));
     const attributes=new rhino.ObjectAttributes();attributes.name=`SECTION_${String(index+1).padStart(3,"0")}`;attributes.layerIndex=layerIndex;attributes.setUserString("Source","Smoothed SubD section field");file.objects().addMesh(mesh,attributes);attributes.delete();mesh.delete();
   });
-  downloadRhinoFile(file,rhino,version,`section-forge-surfaces-rhino${version}.3dm`);file.delete();
+  downloadRhinoFile(file,rhino,version,`sand-scan-surfaces-rhino${version}.3dm`);file.delete();
 }
 
 type Point2=[number,number];
@@ -423,10 +430,8 @@ type RuledStrip={a:Vec[];b:Vec[];kind:"outer"|"void"};
 type PointOffsets=Record<string,Vec>;
 type LongitudinalFamily={primary:Vec[][];primaryRoles:string[];offset:Vec[][];tweens:Vec[][];branches:Vec[][];branchPlates:RuledStrip[];ruled:RuledStrip[];anchors:{point:Vec;role:string}[]};
 type CirculationSettings={primaryCount:number;pathWidth:number;activeBranches:number;junctionWidth:number;smoothing:number};
-type FloorPlateSettings={noiseReduction:number;plateThickness:number;surfaceFlow:number};
 type CirculationRibbon={center:Vec[];left:Vec[];right:Vec[];kind:"spine"|"branch"};
 type CirculationGeometry={ribbons:CirculationRibbon[];floorY:number;topY:number;trimmedCount:number};
-type SpatialPlate={profiles:Vec[][][];cellCount:number};
 const CHUNK_HALF=1.05;
 
 function smoothSpatialRoute(line:Vec[],amount:number){
@@ -436,7 +441,7 @@ function smoothSpatialRoute(line:Vec[],amount:number){
   return result;
 }
 
-function buildCirculationGeometry(families:LongitudinalFamily,settings:CirculationSettings,heightInches:number,bifurcationsPerPrimary:number):CirculationGeometry{
+function buildCirculationGeometry(families:LongitudinalFamily,settings:CirculationSettings,heightInches:number,bifurcationsPerPrimary:number,includeBranches=true):CirculationGeometry{
   const floorY=-CHUNK_HALF+.08,heightFeet=heightInches/12,topY=Math.min(CHUNK_HALF,floorY+heightFeet/20*(CHUNK_HALF*2));
   if(!families.primary.length)return{ribbons:[],floorY,topY,trimmedCount:0};
   const selectedCount=Math.max(1,Math.min(families.primary.length,settings.primaryCount));
@@ -444,8 +449,7 @@ function buildCirculationGeometry(families:LongitudinalFamily,settings:Circulati
   const sources:[Vec[],"spine"|"branch"][]=[];
   selectedIndices.forEach(primaryIndex=>{
     sources.push([families.primary[primaryIndex],"spine"]);
-    const branchStart=primaryIndex*Math.max(0,bifurcationsPerPrimary);
-    families.branches.slice(branchStart,branchStart+Math.max(0,settings.activeBranches)).forEach(line=>sources.push([line,"branch"]));
+    if(includeBranches){const branchStart=primaryIndex*Math.max(0,bifurcationsPerPrimary);families.branches.slice(branchStart,branchStart+Math.max(0,settings.activeBranches)).forEach(line=>sources.push([line,"branch"]))}
   });
   let trimmedCount=0;
   const ribbons=sources.map(([source,kind])=>{
@@ -456,18 +460,6 @@ function buildCirculationGeometry(families:LongitudinalFamily,settings:Circulati
     return{center,left,right,kind};
   }).filter(ribbon=>ribbon.center.length>1);
   return{ribbons,floorY,topY,trimmedCount};
-}
-
-function buildUnifiedFloorPlate(circulation:CirculationGeometry,settings:FloorPlateSettings):SpatialPlate{
-  const sample=(line:Vec[],count:number)=>Array.from({length:count},(_,index)=>{const position=index/Math.max(1,count-1)*Math.max(0,line.length-1),a=Math.floor(position),b=Math.min(line.length-1,a+1),t=position-a;return[line[a][0]+(line[b][0]-line[a][0])*t,line[a][1]+(line[b][1]-line[a][1])*t,line[a][2]+(line[b][2]-line[a][2])*t] as Vec});
-  const rails=circulation.ribbons.map(ribbon=>smoothSpatialRoute(ribbon.center,settings.noiseReduction)).filter(line=>line.length>1),spaceExpansion=Math.max(0,Math.min(100,settings.surfaceFlow))/100;
-  const pairs=rails.length>1?rails.slice(0,-1).map((rail,index)=>[rail,rails[index+1]] as [Vec[],Vec[]]):circulation.ribbons.slice(0,1).map(ribbon=>[smoothSpatialRoute(ribbon.left,settings.noiseReduction),smoothSpatialRoute(ribbon.right,settings.noiseReduction)] as [Vec[],Vec[]]);
-  const profiles=pairs.map(([railA,railB])=>{
-    const count=Math.max(2,Math.max(railA.length,railB.length)),a=sample(railA,count),b=sample(railB,count);
-    return Array.from({length:count},(_,index)=>{const progress=index/Math.max(1,count-1),node=Math.pow(Math.sin(Math.PI*progress),4),expansion=1+spaceExpansion*(.08+node*.35),mid:[number,number,number]=[(a[index][0]+b[index][0])/2,(a[index][1]+b[index][1])/2,(a[index][2]+b[index][2])/2],expand=(point:Vec):Vec=>[Math.max(-CHUNK_HALF,Math.min(CHUNK_HALF,mid[0]+(point[0]-mid[0])*expansion)),Math.max(circulation.floorY,Math.min(circulation.topY,point[1])),Math.max(-CHUNK_HALF,Math.min(CHUNK_HALF,mid[2]+(point[2]-mid[2])*expansion))];return[expand(a[index]),expand(b[index])]});
-  });
-  const cellCount=profiles.reduce((sum,route)=>sum+Math.max(0,route.length-1)*Math.max(0,(route[0]?.length??1)-1),0);
-  return{profiles,cellCount};
 }
 
 function longitudinalFamilies(slices:Slice[],loops:Point2[][][],primaryCount:number,smoothing:number,offsetsPerPrimary:number,bifurcationsPerPrimary:number,bifurcationDistance:number,bifurcationScale:number,branchDirections:number[],pointOffsets:PointOffsets):LongitudinalFamily{
@@ -522,7 +514,7 @@ async function exportRhinoSectionLines(slices:Slice[],version:7|8,fidelity:numbe
   if(!slices.length)return;
   const [{default:rhino3dm},{default:wasmUrl}]=await Promise.all([import("rhino3dm"),import("rhino3dm/rhino3dm.wasm?url")]);
   const rhino=await rhino3dm({locateFile:()=>wasmUrl}),file=new rhino.File3dm();
-  file.applicationName="Section Forge";file.applicationDetails=`CT section boundary curves · Rhino ${version}`;
+  file.applicationName="Sand Scan";file.applicationDetails=`CT section boundary curves · Rhino ${version}`;
   file.startSectionComments=`Joined section contours written for Rhino ${version}. Exterior perimeters and internal void boundaries are editable curve objects; no pixels or meshes are included.`;
   const layerIndex=file.layers().addLayer("CT_SECTION_BOUNDARY_LINES",{r:139,g:217,b:207,a:255});let curveCount=0;
   slices.forEach((slice,sectionIndex)=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,fidelity)).forEach((loop,boundaryIndex)=>{
@@ -532,7 +524,7 @@ async function exportRhinoSectionLines(slices:Slice[],version:7|8,fidelity:numbe
     file.objects().addCurve(curve,attributes);curveCount++;attributes.delete();curve.delete();
   }));
   file.startSectionComments+=` ${curveCount} joined boundary curves exported from ${slices.length} sections.`;
-  downloadRhinoFile(file,rhino,version,`section-forge-boundary-lines-rhino${version}.3dm`);file.delete();
+  downloadRhinoFile(file,rhino,version,`sand-scan-boundary-lines-rhino${version}.3dm`);file.delete();
 }
 
 const EXPORT_TILE_INCHES=240;
@@ -596,15 +588,37 @@ function addBoundaryCurves(file:any,rhino:any,slices:Slice[],fidelity:number,hei
   return curveCount;
 }
 
+async function exportLoftBundle(model:LoftModel,thickness:number,version:7|8){
+  if(model.rows.length<2)return;
+  const [{default:rhino3dm},{default:wasmUrl}]=await Promise.all([import("rhino3dm"),import("rhino3dm/rhino3dm.wasm?url")]);
+  const rhino=await rhino3dm({locateFile:()=>wasmUrl}),file=new rhino.File3dm();
+  file.settings().modelUnitSystem=rhino.UnitSystem.Inches;file.settings().pageUnitSystem=rhino.UnitSystem.Feet;
+  file.applicationName="Sand Scan";
+  const scale=240/2.1,base=Math.min(...model.rows.flat().map(p=>p[1]))-thickness/scale;
+  const point=(p:number[])=>[p[0]*scale,p[2]*scale,(p[1]-base)*scale];
+  const addMesh=(depth:number,name:string,color:{r:number;g:number;b:number;a:number})=>{
+    const data=loftDisplayMesh(model.rows,depth/scale),mesh=new rhino.Mesh(),ids=new Map<string,number>();
+    for(let i=0;i<data.positions.length;i+=9){const face:number[]=[];for(let j=0;j<9;j+=3){const p=point(Array.from(data.positions.slice(i+j,i+j+3))),key=p.map(v=>v.toFixed(5)).join(",");let id=ids.get(key);if(id===undefined){id=mesh.vertices().addPoint3d(p[0],p[1],p[2]);ids.set(key,id)}face.push(id)}if(new Set(face).size===3)mesh.faces().addTriFace(face[0],face[1],face[2]);}
+    mesh.normals().computeNormals();const attr=new rhino.ObjectAttributes();attr.name=name;attr.layerIndex=file.layers().addLayer(name,color);file.objects().addMesh(mesh,attr);attr.delete();mesh.delete();
+  };
+  addMesh(thickness,"01_CIRCULATION_LOFT_FORM",{r:22,g:128,b:255,a:255});
+  addMesh(0,"02_LOFT_SURFACE_MESH",{r:212,g:37,b:210,a:255});
+  const layer=file.layers().addLayer("03_LOFT_CURVES",{r:255,g:38,b:140,a:255});
+  const curves=[...model.rows,...model.rails,model.rows.map(row=>row[0]),model.rows.map(row=>row.at(-1)!)];
+  curves.forEach((row,i)=>{const curve=new rhino.PolylineCurve(row.map(p=>point(p))),attr=new rhino.ObjectAttributes();attr.name=`LOFT_CURVE_${i+1}`;attr.layerIndex=layer;file.objects().addCurve(curve,attr);attr.delete();curve.delete()});
+  file.startSectionComments="Rendered circulation loft geometry. Model units inches; layout feet. Full unclipped membrane, surface mesh, and editable curves. Mesh geometry, not native Rhino SubD. Positive membrane thickness closes the outer rim.";
+  downloadRhinoFile(file,rhino,version,`sand-scan-loft-rhino${version}.3dm`);file.delete();
+}
+
 async function exportRhinoBundle(slices:Slice[],version:7|8,fidelity:number,height:number,primaryCount:number,offsetsPerPrimary:number){
   if(!slices.length)return;
   const [{default:rhino3dm},{default:wasmUrl}]=await Promise.all([import("rhino3dm"),import("rhino3dm/rhino3dm.wasm?url")]);
   const rhino=await rhino3dm({locateFile:()=>wasmUrl}),file=new rhino.File3dm();
   const settings=file.settings();settings.modelUnitSystem=rhino.UnitSystem.Inches;settings.pageUnitSystem=rhino.UnitSystem.Feet;settings.modelAbsoluteTolerance=.001;
-  file.applicationName="Section Forge";file.applicationDetails=`20ft x 20ft maximum imperial unified-space package · Rhino ${version}`;
+  file.applicationName="Sand Scan";file.applicationDetails=`20ft x 20ft maximum imperial unified-space package · Rhino ${version}`;
   const faces=addPrintableForm(file,rhino,slices,height,primaryCount,offsetsPerPrimary),surfaces=addSectionSurfaces(file,rhino,slices,height),curves=addBoundaryCurves(file,rhino,slices,fidelity,height);
-  file.startSectionComments=`Imperial one-file Section Forge export for Rhino ${version}. Model units: inches; layout units: feet. All geometry is constrained to a maximum 20ft x 20ft footprint and ${height/12}ft overall height. The closed printable mesh is one ruled loft driven by ${primaryCount} primary lines with ${offsetsPerPrimary} offsets per primary through every section (${faces} faces), with ${surfaces} reference section surfaces and ${curves} editable boundary curves.`;
-  downloadRhinoFile(file,rhino,version,`section-forge-complete-rhino${version}.3dm`);file.delete();
+  file.startSectionComments=`Imperial one-file Sand Scan export for Rhino ${version}. Model units: inches; layout units: feet. All geometry is constrained to a maximum 20ft x 20ft footprint and ${height/12}ft overall height. The closed printable mesh is one ruled loft driven by ${primaryCount} primary lines with ${offsetsPerPrimary} offsets per primary through every section (${faces} faces), with ${surfaces} reference section surfaces and ${curves} editable boundary curves.`;
+  downloadRhinoFile(file,rhino,version,`sand-scan-complete-rhino${version}.3dm`);file.delete();
 }
 
 function CirculationPreview({slices,fidelity,primaryCount,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,smoothing,settings,setSettings,heightInches,setHeightInches,position,onDragStart}:{slices:Slice[];fidelity:number;primaryCount:number;offsetsPerPrimary:number;bifurcationsPerPrimary:number;bifurcationDistance:number;bifurcationScale:number;smoothing:number;settings:CirculationSettings;setSettings:React.Dispatch<React.SetStateAction<CirculationSettings>>;heightInches:number;setHeightInches:(value:number)=>void;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
@@ -612,120 +626,112 @@ function CirculationPreview({slices,fidelity,primaryCount,offsetsPerPrimary,bifu
   const normalized=useMemo(()=>{if(!slices.length)return[] as Slice[];const center=(slices[0].z+slices.at(-1)!.z)/2,span=Math.max(.001,Math.abs(slices[0].z-slices.at(-1)!.z));return slices.map(slice=>({...slice,z:(slice.z-center)/span*2.1}))},[slices]);
   const loops=useMemo(()=>normalized.map(slice=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,fidelity))),[normalized,fidelity]);
   const families=useMemo(()=>longitudinalFamilies(normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,[],{}),[normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale]);
-  const circulation=useMemo(()=>buildCirculationGeometry(families,settings,heightInches,bifurcationsPerPrimary),[families,settings,heightInches,bifurcationsPerPrimary]);
-  useEffect(()=>{setSettings(current=>({...current,primaryCount:Math.max(1,Math.min(current.primaryCount,Math.max(1,families.primary.length))),activeBranches:Math.min(current.activeBranches,bifurcationsPerPrimary)}))},[families.primary.length,bifurcationsPerPrimary,setSettings]);
+  const circulation=useMemo(()=>buildCirculationGeometry(families,settings,heightInches,bifurcationsPerPrimary,false),[families,settings,heightInches,bifurcationsPerPrimary]);
+  useEffect(()=>{if(families.primary.length)setSettings(current=>({...current,primaryCount:Math.max(1,Math.min(current.primaryCount,families.primary.length))}))},[families.primary.length,setSettings]);
   useEffect(()=>{
     const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;const width=c.width,height=c.height;ctx.fillStyle="#071014";ctx.fillRect(0,0,width,height);
     if(!circulation.ribbons.length){ctx.fillStyle="#8fa9ae";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select depth sections to generate circulation",width/2,height/2);return}
     const rotate=([x,y,z]:Vec):Vec=>{const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]},project=(point:Vec)=>{const [x,y,z]=rotate(point),perspective=5.2/(5.2+z),scale=180*camera.zoom*perspective;return{x:width*.5+x*scale,y:height*.54-y*scale,z}};
     const bottom=[[-CHUNK_HALF,circulation.floorY,-CHUNK_HALF],[CHUNK_HALF,circulation.floorY,-CHUNK_HALF],[CHUNK_HALF,circulation.floorY,CHUNK_HALF],[-CHUNK_HALF,circulation.floorY,CHUNK_HALF]] as Vec[],top=bottom.map(([x,,z])=>[x,circulation.topY,z] as Vec);ctx.strokeStyle="rgba(119,205,199,.28)";ctx.lineWidth=.8;for(const ring of [bottom,top]){ctx.beginPath();ring.forEach((p,i)=>{const s=project(p);i?ctx.lineTo(s.x,s.y):ctx.moveTo(s.x,s.y)});ctx.closePath();ctx.stroke()}for(let i=0;i<4;i++){const a=project(bottom[i]),b=project(top[i]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke()}
     const cells=circulation.ribbons.flatMap(ribbon=>Array.from({length:Math.max(0,Math.min(ribbon.left.length,ribbon.right.length)-1)},(_,index)=>{const screen=[ribbon.left[index],ribbon.right[index],ribbon.right[index+1],ribbon.left[index+1]].map(project);return{screen,depth:screen.reduce((sum,p)=>sum+p.z,0)/4,kind:ribbon.kind}})).sort((a,b)=>b.depth-a.depth);
-    cells.forEach(cell=>{ctx.fillStyle=cell.kind==="spine"?"rgba(95,231,218,.34)":"rgba(242,151,72,.3)";ctx.strokeStyle=cell.kind==="spine"?"rgba(166,255,245,.72)":"rgba(255,203,127,.7)";ctx.lineWidth=.65;ctx.beginPath();ctx.moveTo(cell.screen[0].x,cell.screen[0].y);for(let i=1;i<4;i++)ctx.lineTo(cell.screen[i].x,cell.screen[i].y);ctx.closePath();ctx.fill();ctx.stroke()});
-    circulation.ribbons.forEach(ribbon=>{const points=ribbon.center.map(project);ctx.strokeStyle=ribbon.kind==="spine"?"rgba(95,231,218,.96)":"rgba(255,184,97,.9)";ctx.lineWidth=ribbon.kind==="spine"?2:1.4;ctx.beginPath();points.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.stroke()});ctx.fillStyle="#789a9d";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`20′ × 20′ ENVELOPE · ${heightInches/12}′ HEIGHT · ONE OCCUPIABLE FLOOR`,14,20);
+    cells.forEach(cell=>{ctx.fillStyle=cell.kind==="spine"?viewportColor("primary",.34):viewportColor("secondary",.3);ctx.strokeStyle=cell.kind==="spine"?viewportColor("primary",.72):viewportColor("secondary",.7);ctx.lineWidth=.65;ctx.beginPath();ctx.moveTo(cell.screen[0].x,cell.screen[0].y);for(let i=1;i<4;i++)ctx.lineTo(cell.screen[i].x,cell.screen[i].y);ctx.closePath();ctx.fill();ctx.stroke()});
+    circulation.ribbons.forEach(ribbon=>{const points=ribbon.center.map(project);ctx.strokeStyle=ribbon.kind==="spine"?viewportColor("primary",.96):viewportColor("secondary",.9);ctx.lineWidth=ribbon.kind==="spine"?2:1.4;ctx.beginPath();points.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.stroke()});ctx.fillStyle="#789a9d";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`20′ × 20′ ENVELOPE · ${heightInches/12}′ HEIGHT · ONE OCCUPIABLE FLOOR`,14,20);
   },[circulation,camera,heightInches]);
   return <article className="spatial-rational-node circulation-node" style={{left:position.x,top:position.y}}>
-    <header onPointerDown={onDragStart}><div className="model-icon"><Route size={19}/></div><div><h2>Circulation Skeleton</h2><p>True 3D cage lines → multiple occupiable routes</p></div><span>DRAG · ORBIT</span></header>
+    <header onPointerDown={onDragStart}><div className="model-icon"><Route size={19}/></div><div><h2>Circulation Skeleton</h2><p>Primary cage lines → occupiable routes</p></div><span>DRAG · ORBIT</span></header>
     <div className="rational-viewport"><canvas ref={canvas} width={700} height={390} aria-label="Rotatable 3D preview of circulation routes constrained to a twenty foot square spatial chunk" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.72,pitch:.38,zoom:1})}>Reset view</button></div>
     <div className="spatial-constraint-band"><strong>20′ × 20′</strong><span>Single occupiable floor</span><span>Outside geometry trimmed</span><label>Height <b>{heightInches/12}′</b><input type="range" min="96" max="240" step="12" value={heightInches} onChange={event=>setHeightInches(Number(event.target.value))}/></label></div>
     <div className="rational-controls">
       <label><span>Primary circulations</span><strong>{Math.min(settings.primaryCount,Math.max(1,families.primary.length))}</strong><input type="range" min="1" max={Math.max(1,families.primary.length)} step="1" value={Math.min(settings.primaryCount,Math.max(1,families.primary.length))} onChange={event=>setSettings(current=>({...current,primaryCount:Number(event.target.value)}))}/><small>Evenly distributed cage lines, preserved in XYZ</small></label>
       <label><span>Path width</span><strong>{settings.pathWidth}′</strong><input type="range" min="4" max="8" step=".5" value={settings.pathWidth} onChange={event=>setSettings(current=>({...current,pathWidth:Number(event.target.value)}))}/><small>Clear occupiable route</small></label>
-      <label><span>Bifurcations per primary</span><strong>{settings.activeBranches}</strong><input type="range" min="0" max={Math.max(0,bifurcationsPerPrimary)} step="1" value={Math.min(settings.activeBranches,bifurcationsPerPrimary)} onChange={event=>setSettings(current=>({...current,activeBranches:Number(event.target.value)}))}/><small>Repeated for every selected primary route</small></label>
       <label><span>Junction widening</span><strong>{settings.junctionWidth}%</strong><input type="range" min="0" max="100" step="5" value={settings.junctionWidth} onChange={event=>setSettings(current=>({...current,junctionWidth:Number(event.target.value)}))}/><small>Threshold expansion</small></label>
       <label><span>Route smoothing</span><strong>{settings.smoothing}%</strong><input type="range" min="0" max="100" step="5" value={settings.smoothing} onChange={event=>setSettings(current=>({...current,smoothing:Number(event.target.value)}))}/><small>Remove directional noise</small></label>
     </div>
-    <div className="rational-summary"><span><strong>{Math.min(settings.primaryCount,Math.max(1,families.primary.length))}</strong>primary routes</span><span><strong>{circulation.ribbons.length}</strong>3D paths</span><span><strong>{circulation.trimmedCount}</strong>points trimmed</span><span><strong>XYZ</strong>cage preserved</span></div>
+    <div className="rational-summary"><span><strong>{Math.min(settings.primaryCount,Math.max(1,families.primary.length))}</strong>primary routes</span><span><strong>{circulation.ribbons.length}</strong>3D paths</span><span><strong>{circulation.trimmedCount}</strong>points trimmed</span><span><strong>0</strong>bifurcations</span></div>
+    <p className="rational-note">Only the selected primary lines from the Unified Section Cage become circulation. Cage bifurcations remain available in the combined framework, but are excluded from this circulation skeleton.</p>
     <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
   </article>;
 }
 
-function CageCirculationPreview({slices,fidelity,primaryCount,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,smoothing,circulationSettings,heightInches,position,onDragStart}:{slices:Slice[];fidelity:number;primaryCount:number;offsetsPerPrimary:number;bifurcationsPerPrimary:number;bifurcationDistance:number;bifurcationScale:number;smoothing:number;circulationSettings:CirculationSettings;heightInches:number;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
-  type FrameworkView="perspective"|"top"|"front"|"back"|"left"|"right";
-  const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null),[view,setView]=useState<FrameworkView>("perspective"),[camera,setCamera]=useState({yaw:-.72,pitch:.36}),[zoom,setZoom]=useState(1),[pathEmphasis,setPathEmphasis]=useState(72);
+function PrimaryCirculationLoftPreview({slices,fidelity,primaryCount,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,smoothing,circulationSettings,heightInches,position,onDragStart,onMembrane}:{slices:Slice[];fidelity:number;primaryCount:number;offsetsPerPrimary:number;bifurcationsPerPrimary:number;bifurcationDistance:number;bifurcationScale:number;smoothing:number;circulationSettings:CirculationSettings;heightInches:number;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void;onMembrane:React.Dispatch<React.SetStateAction<LoftModel>>}){
+  const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null),[camera,setCamera]=useState({yaw:-.72,pitch:.36,zoom:1}),[loftOpacity,setLoftOpacity]=useState(74),[sectionDensity,setSectionDensity]=useState(55);
+  const [extension,setExtension]=useState(55),[fairing,setFairing]=useState(70);
   const normalized=useMemo(()=>{if(!slices.length)return[] as Slice[];const center=(slices[0].z+slices.at(-1)!.z)/2,span=Math.max(.001,Math.abs(slices[0].z-slices.at(-1)!.z));return slices.map(slice=>({...slice,z:(slice.z-center)/span*2.1}))},[slices]);
   const loops=useMemo(()=>normalized.map(slice=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,fidelity))),[normalized,fidelity]);
   const families=useMemo(()=>longitudinalFamilies(normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,[],{}),[normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale]);
-  const circulation=useMemo(()=>buildCirculationGeometry(families,circulationSettings,heightInches,bifurcationsPerPrimary),[families,circulationSettings,heightInches,bifurcationsPerPrimary]);
+  const circulation=useMemo(()=>buildCirculationGeometry(families,circulationSettings,heightInches,bifurcationsPerPrimary,false),[families,circulationSettings,heightInches,bifurcationsPerPrimary]);
+  const primaryCirculations=useMemo(()=>circulation.ribbons.filter(ribbon=>ribbon.kind==="spine"),[circulation]);
+  const membrane=useMemo(()=>waterfall(primaryCirculations,extension,fairing),[primaryCirculations,extension,fairing]);
+  useEffect(()=>onMembrane(membrane),[membrane,onMembrane]);
   useEffect(()=>{
-    const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;const width=c.width,height=c.height;ctx.fillStyle="#071014";ctx.fillRect(0,0,width,height);
-    if(!normalized.length){ctx.fillStyle="#8fa9ae";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select depth sections to combine cage and circulation",width/2,height/2);return}
-    const orient=([x,y,z]:Vec):Vec=>{if(view==="perspective"){const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]}return view==="top"?[x,-z,y]:view==="front"?[x,y,z]:view==="back"?[-x,y,-z]:view==="left"?[z,y,x]:[-z,y,-x]},project=(point:Vec)=>{const [x,y,depth]=orient(point),perspective=view==="perspective"?5.25/(5.25+depth):1,scale=166*zoom*perspective;return{x:width*.5+x*scale,y:height*.53-y*scale,z:depth}};
-    const transverse=loops.flatMap((section,index)=>section.map(loop=>loop.map(([x,y])=>[(x/(W-1)-.5)*2.25,(.5-y/(H-1))*1.7,normalized[index].z] as Vec))).map(line=>({line,depth:line.reduce((sum,p)=>sum+orient(p)[2],0)/Math.max(1,line.length)})).sort((a,b)=>b.depth-a.depth);
-    transverse.forEach(({line})=>{const points=line.map(project);ctx.strokeStyle="rgba(94,139,144,.25)";ctx.lineWidth=.55;ctx.beginPath();points.forEach((p,index)=>index?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.closePath();ctx.stroke()});
-    const draw=(lines:Vec[][],color:string,lineWidth:number)=>lines.forEach(line=>{const points=line.map(project);if(points.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=lineWidth;ctx.beginPath();ctx.moveTo(points[0].x,points[0].y);for(let index=1;index<points.length-1;index++){const next=points[index+1],mid={x:(points[index].x+next.x)/2,y:(points[index].y+next.y)/2};ctx.quadraticCurveTo(points[index].x,points[index].y,mid.x,mid.y)}ctx.lineTo(points.at(-1)!.x,points.at(-1)!.y);ctx.stroke()});
-    draw(families.offset,"rgba(211,109,224,.46)",.75);draw(families.primary,"rgba(95,231,218,.84)",1.25);draw(families.branches,"rgba(255,184,97,.72)",1);
-    const alpha=.2+pathEmphasis/100*.45,cells=circulation.ribbons.flatMap(ribbon=>Array.from({length:Math.max(0,Math.min(ribbon.left.length,ribbon.right.length)-1)},(_,index)=>{const screen=[ribbon.left[index],ribbon.right[index],ribbon.right[index+1],ribbon.left[index+1]].map(project);return{screen,depth:screen.reduce((sum,p)=>sum+p.z,0)/4,kind:ribbon.kind}})).sort((a,b)=>b.depth-a.depth);
-    cells.forEach(cell=>{ctx.fillStyle=cell.kind==="spine"?`rgba(95,231,218,${alpha})`:`rgba(242,151,72,${alpha*.9})`;ctx.strokeStyle=cell.kind==="spine"?"rgba(198,255,248,.7)":"rgba(255,211,145,.66)";ctx.lineWidth=.7;ctx.beginPath();ctx.moveTo(cell.screen[0].x,cell.screen[0].y);for(let index=1;index<4;index++)ctx.lineTo(cell.screen[index].x,cell.screen[index].y);ctx.closePath();ctx.fill();ctx.stroke()});
-    circulation.ribbons.forEach(ribbon=>draw([ribbon.center],ribbon.kind==="spine"?"rgba(225,255,251,.96)":"rgba(255,222,172,.92)",ribbon.kind==="spine"?2.2:1.6));ctx.fillStyle="#789a9d";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`${view.toUpperCase()} ${view==="perspective"?"VIEW":"ORTHOGRAPHIC"} · SECTION CAGE + OCCUPIABLE CIRCULATION`,14,20);
-  },[normalized,loops,families,circulation,view,camera,zoom,pathEmphasis]);
-  return <article className="spatial-rational-node combined-framework-node" style={{left:position.x,top:position.y}}>
-    <header onPointerDown={onDragStart}><div className="model-icon"><Layers3 size={19}/></div><div><h2>Cage + Circulation Framework</h2><p>Unified section lines and occupiable paths</p></div><span>DRAG · MULTIVIEW</span></header>
-    <div className="geometry-mode framework-view-switcher"><span>Viewport</span><div>{(["perspective","top","front","back","left","right"] as FrameworkView[]).map(option=><button key={option} className={view===option?"active":""} onClick={()=>setView(option)}>{option[0].toUpperCase()+option.slice(1)}</button>)}</div><small>Perspective supports orbiting; architectural elevations and plan use undistorted parallel projection.</small></div>
-    <div className="rational-viewport"><canvas ref={canvas} width={700} height={390} aria-label={`${view} view of the unified section cage and circulation skeleton`} onPointerDown={event=>{if(view!=="perspective")return;event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(!start||view!=="perspective")return;setCamera({yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))})}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setZoom(value=>Math.max(.55,Math.min(2.2,value-event.deltaY*.0012)))}}/><span>{view==="perspective"?"Drag to orbit · wheel to zoom":`Wheel to zoom · ${view} orthographic`}</span><button onClick={()=>{setZoom(1);setCamera({yaw:-.72,pitch:.36})}}>Reset view</button></div>
-    <div className="spatial-constraint-band"><strong>20′ × 20′</strong><span>{heightInches/12}′ adjustable height</span><span>Cage preserved in XYZ</span><span>One circulation system</span></div>
-    <div className="rational-controls"><label><span>Circulation emphasis</span><strong>{pathEmphasis}%</strong><input type="range" min="10" max="100" step="5" value={pathEmphasis} onChange={event=>setPathEmphasis(Number(event.target.value))}/><small>Cage dominant</small><small>Paths dominant</small></label></div>
-    <div className="rational-summary"><span><strong>{families.primary.length}</strong>primary cage lines</span><span><strong>{families.offset.length}</strong>offset lines</span><span><strong>{families.branches.length}</strong>bifurcations</span><span><strong>{circulation.ribbons.length}</strong>circulation paths</span></div>
-    <p className="rational-note">The section cage remains the geometric reference system. Circulation is overlaid on selected primary and bifurcating lines, so the occupiable paths can be evaluated without losing the original longitudinal hierarchy.</p>
+    const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;const width=c.width,height=c.height;ctx.fillStyle="#020202";ctx.fillRect(0,0,width,height);
+    if(primaryCirculations.length<2){ctx.fillStyle="#8fa9ae";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select at least two primary circulations to loft between them",width/2,height/2);return}
+    const rotate=([x,y,z]:Vec):Vec=>{const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]},project=(point:Vec)=>{const [x,y,z]=rotate(point),perspective=5.3/(5.3+z),scale=184*camera.zoom*perspective;return{x:width*.5+x*scale,y:height*.54-y*scale,z}};
+    const draw=(line:Vec[],color:string,lineWidth:number)=>{ctx.strokeStyle=color;ctx.lineWidth=lineWidth;ctx.beginPath();line.map(project).forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.stroke()};
+    const faces=membrane.rows.slice(1).flatMap((row,i)=>row.slice(1).map((_,j)=>{const screen=[membrane.rows[i][j],membrane.rows[i][j+1],row[j+1],row[j]].map(project);return{screen,depth:screen.reduce((sum,p)=>sum+p.z,0)/4}})).sort((a,b)=>b.depth-a.depth);
+    faces.forEach(face=>{ctx.fillStyle=viewportColor("primary",loftOpacity/100*.75);ctx.beginPath();face.screen.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.closePath();ctx.fill()});
+    const sectionStep=Math.max(2,Math.round(24-sectionDensity/100*22));
+    membrane.rows.forEach((row,i)=>{if(i%sectionStep===0||i===membrane.rows.length-1)draw(row,viewportColor("secondary",.85),1)});
+    membrane.rails.forEach(rail=>draw(rail,VIEWPORT_PRIMARY,2));
+    if(membrane.rows.length){draw(membrane.rows.map(row=>row[0]),VIEWPORT_TERTIARY,1.2);draw(membrane.rows.map(row=>row.at(-1)!),VIEWPORT_TERTIARY,1.2)}
+    ctx.fillStyle="#789a9d";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText("CONTINUOUS FLOOR MEMBRANE · WATERFALL TRANSITIONS",14,20);
+  },[primaryCirculations,membrane,camera,loftOpacity,sectionDensity]);
+  const faceCount=Math.max(0,membrane.rows.length-1)*Math.max(0,(membrane.rows[0]?.length??0)-1);
+  return <article className="spatial-rational-node primary-loft-node" style={{left:position.x,top:position.y}}>
+    <header onPointerDown={onDragStart}><div className="model-icon"><Sparkles size={19}/></div><div><h2>Primary Circulation Loft</h2><p>Flat circulation bands → flowing waterfall membrane</p></div><span>DRAG · ORBIT</span></header>
+    <div className="rational-viewport"><canvas ref={canvas} width={700} height={390} aria-label="Rotatable 3D continuous floor membrane with curved waterfall transitions" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.72,pitch:.36,zoom:1})}>Reset view</button></div>
+    <div className="spatial-constraint-band compact"><strong>20′ × 20′</strong><span>{heightInches/12}′ height</span><span>Primary routes only</span><span>No bifurcations</span></div>
+    <div className="rational-controls"><label><span>Horizontal extension</span><strong>{extension}%</strong><input type="range" min="0" max="100" value={extension} onChange={e=>setExtension(Number(e.target.value))}/><small>Protect flat zones before each bend</small></label><label><span>Longitudinal smoothing</span><strong>{fairing}%</strong><input type="range" min="0" max="100" value={fairing} onChange={e=>setFairing(Number(e.target.value))}/><small>Fair matching stations without moving route ends</small></label><label><span>Loft opacity</span><strong>{loftOpacity}%</strong><input type="range" min="20" max="100" step="5" value={loftOpacity} onChange={event=>setLoftOpacity(Number(event.target.value))}/><small>Transparent</small><small>Solid</small></label><label><span>Section density</span><strong>{sectionDensity}%</strong><input type="range" min="0" max="100" step="5" value={sectionDensity} onChange={event=>setSectionDensity(Number(event.target.value))}/><small>Few cross-sections</small><small>Dense cross-sections</small></label></div>
+    <div className="rational-summary"><span><strong>{primaryCirculations.length}</strong>primary circulations</span><span><strong>{Math.max(0,primaryCirculations.length-1)}</strong>waterfall transitions</span><span><strong>{faceCount}</strong>surface cells</span><span><strong>{circulationSettings.smoothing}%</strong>route smoothing</span></div>
+    <p className="rational-note">Circulation offsets retain the flat floor widths. Horizontal extensions blend tangentially into curved waterfall transitions, creating one continuous membrane. Blue: primary rails and membrane; magenta: section profiles; pink: outer edges. The connected Rhino export uses this loft geometry.</p>
     <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
   </article>;
 }
 
-function UnifiedFloorPlatePreview({slices,fidelity,primaryCount,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,smoothing,circulationSettings,settings,setSettings,heightInches,position,onDragStart}:{slices:Slice[];fidelity:number;primaryCount:number;offsetsPerPrimary:number;bifurcationsPerPrimary:number;bifurcationDistance:number;bifurcationScale:number;smoothing:number;circulationSettings:CirculationSettings;settings:FloorPlateSettings;setSettings:React.Dispatch<React.SetStateAction<FloorPlateSettings>>;heightInches:number;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
-  const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null),[camera,setCamera]=useState({yaw:-.72,pitch:.34,zoom:1});
-  const normalized=useMemo(()=>{if(!slices.length)return[] as Slice[];const center=(slices[0].z+slices.at(-1)!.z)/2,span=Math.max(.001,Math.abs(slices[0].z-slices.at(-1)!.z));return slices.map(slice=>({...slice,z:(slice.z-center)/span*2.1}))},[slices]);
-  const loops=useMemo(()=>normalized.map(slice=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,fidelity))),[normalized,fidelity]);
-  const families=useMemo(()=>longitudinalFamilies(normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,[],{}),[normalized,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale]);
-  const circulation=useMemo(()=>buildCirculationGeometry(families,circulationSettings,heightInches,bifurcationsPerPrimary),[families,circulationSettings,heightInches,bifurcationsPerPrimary]),plate=useMemo(()=>buildUnifiedFloorPlate(circulation,settings),[circulation,settings]);
+function CirculationLoftRender({model,thickness,setThickness,position,onDragStart,onHeight,onCapture}:{onCapture:(capture:()=>string)=>void;onHeight:(height:number)=>void;model:LoftModel;thickness:number;setThickness:(value:number)=>void;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+  const renderNode=useRef<HTMLElement>(null);
+  useEffect(()=>{const node=renderNode.current;if(!node)return;const observer=new ResizeObserver(()=>onHeight(node.offsetHeight));observer.observe(node);onHeight(node.offsetHeight);return()=>observer.disconnect()},[onHeight]);
+  const canvas=useRef<HTMLCanvasElement>(null),renderer=useRef<ReturnType<typeof createLoftRenderer>|null>(null);
+  const initial:LoftCamera={yaw:-.62,pitch:-.35,zoom:1.15,panX:0,panY:0};
+  const [camera,setCamera]=useState<LoftCamera>(initial),[view,setView]=useState("perspective"),[blue,setBlue]=useState(false),[showRails,setShowRails]=useState(false),[renderError,setRenderError]=useState(false),[software,setSoftware]=useState(false),[clipEnabled,setClipEnabled]=useState(false),[clip,setClip]=useState(0);
+  const [spinning,setSpinning]=useState(false);
+  const gesture=useRef<{x:number;y:number;camera:LoftCamera;pan:boolean}|null>(null);
+  useEffect(()=>{try{if(canvas.current)renderer.current=createLoftRenderer(canvas.current,software)}catch{if(!software)setSoftware(true);else setRenderError(true)}return()=>{renderer.current?.dispose();renderer.current=null}},[software]);
+  useEffect(()=>{renderer.current?.draw(model,camera,thickness,blue,showRails,clipEnabled?clip:null)},[model,camera,thickness,blue,showRails,software,clipEnabled,clip]);
   useEffect(()=>{
-    const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;const width=c.width,height=c.height;ctx.fillStyle="#071014";ctx.fillRect(0,0,width,height);
-    if(!plate.profiles.length){ctx.fillStyle="#8fa9ae";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Generate circulation to form paths and occupiable spaces",width/2,height/2);return}
-    const rotate=([x,y,z]:Vec):Vec=>{const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]},project=(point:Vec)=>{const [x,y,z]=rotate(point),perspective=5.3/(5.3+z),scale=180*camera.zoom*perspective;return{x:width*.5+x*scale,y:height*.53-y*scale,z}};
-    const cells=plate.profiles.flatMap(route=>route.slice(0,-1).map((profile,index)=>{const screen=[profile[0],route[index+1][0],route[index+1][1],profile[1]].map(project);return{screen,depth:screen.reduce((sum,p)=>sum+p.z,0)/4}})).sort((a,b)=>b.depth-a.depth);
-    cells.forEach(cell=>{ctx.fillStyle="rgba(71,177,168,.72)";ctx.strokeStyle="rgba(185,245,238,.38)";ctx.lineWidth=.5;ctx.beginPath();ctx.moveTo(cell.screen[0].x,cell.screen[0].y);for(let i=1;i<4;i++)ctx.lineTo(cell.screen[i].x,cell.screen[i].y);ctx.closePath();ctx.fill();ctx.stroke()});
-    plate.profiles.forEach(route=>route.forEach((profile,index)=>{if(index%Math.max(1,Math.floor(route.length/8))!==0&&index!==route.length-1)return;const points=profile.map(project);ctx.strokeStyle="rgba(222,255,251,.55)";ctx.lineWidth=.6;ctx.beginPath();points.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.stroke()}));ctx.fillStyle="#789a9d";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`3D RULED FLOOR SURFACES · ${heightInches/12}′ MAX ENVELOPE HEIGHT`,14,20);
-  },[plate,camera,heightInches]);
-  return <article className="spatial-rational-node floor-plate-node" style={{left:position.x,top:position.y}}>
-    <header onPointerDown={onDragStart}><div className="model-icon"><Layers3 size={19}/></div><div><h2>Unified Floor Plate</h2><p>3D circulation rails → ruled paths and spaces</p></div><span>DRAG · ORBIT</span></header>
-    <div className="rational-viewport"><canvas ref={canvas} width={760} height={420} aria-label="Rotatable preview of three-dimensional ruled floor surfaces derived from circulation lines" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.72,pitch:.34,zoom:1})}>Reset view</button></div>
-    <div className="spatial-constraint-band"><strong>20′ × 20′</strong><span>{heightInches/12}′ adjustable height</span><span>One floor only</span><span>Envelope trim active</span></div>
-    <div className="rational-controls floor-controls">
-      <label><span>Noise removal</span><strong>{settings.noiseReduction}%</strong><input type="range" min="0" max="100" step="5" value={settings.noiseReduction} onChange={event=>setSettings(current=>({...current,noiseReduction:Number(event.target.value)}))}/><small>Simplifies hooks and short deviations</small></label>
-      <label><span>Floor plate thickness</span><strong>{settings.plateThickness}″</strong><input type="range" min="6" max="18" step="1" value={settings.plateThickness} onChange={event=>setSettings(current=>({...current,plateThickness:Number(event.target.value)}))}/><small>Single occupiable datum</small></label>
-      <label><span>Path-to-space expansion</span><strong>{settings.surfaceFlow}%</strong><input type="range" min="0" max="100" step="5" value={settings.surfaceFlow} onChange={event=>setSettings(current=>({...current,surfaceFlow:Number(event.target.value)}))}/><small>Direct circulation band</small><small>Expanded occupiable nodes</small></label>
+    if(!spinning||model.rows.length<2||renderError)return;
+    let last=performance.now();
+    const timer=window.setInterval(()=>{const now=performance.now(),elapsed=Math.min((now-last)/1000,.25);last=now;if(document.hidden)return;setCamera(current=>({...current,yaw:(current.yaw+elapsed*Math.PI/10)%(Math.PI*2)}))},software?100:33);
+    return()=>window.clearInterval(timer);
+  },[spinning,model.rows.length,renderError,software]);
+  useEffect(()=>{onCapture(()=>{if(model.rows.length<2)throw new Error("Generate a circulation loft before exporting.");const image=document.createElement("canvas");image.width=1600;image.height=1088;const output=createLoftRenderer(image,true);try{output.draw(model,camera,thickness,false,false,clipEnabled?clip:null);return image.toDataURL("image/png")}finally{output.dispose()}})},[model,camera,thickness,clipEnabled,clip,onCapture]);
+  const [recording,setRecording]=useState(false),[recordedFrames,setRecordedFrames]=useState(0),[gifError,setGifError]=useState("");
+  const recordingJob=useRef<{timer:number;gif:ModelGif;output:ReturnType<typeof createLoftRenderer>}|null>(null);
+  useEffect(()=>()=>{const job=recordingJob.current;if(job){window.clearInterval(job.timer);job.output.dispose()}},[]);
+  const stopRecording=()=>{const job=recordingJob.current;if(!job)return;window.clearInterval(job.timer);recordingJob.current=null;job.output.dispose();setRecording(false);if(job.gif.frames){const url=URL.createObjectURL(job.gif.blob()),link=document.createElement("a");link.href=url;link.download="sand-scan-loft-rotation.gif";link.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}};
+  const recordGif=()=>{setSpinning(false);setGifError("");const canvas=document.createElement("canvas");canvas.width=480;canvas.height=326;const output=createLoftRenderer(canvas,true),gif=new ModelGif(480,326),start={...camera};let frame=0;setRecording(true);setRecordedFrames(0);
+   const tick=()=>{try{const current={...start,yaw:start.yaw+frame*Math.PI*2/160};output.draw(model,current,thickness,blue,showRails,clipEnabled?clip:null);gif.add(canvas.getContext("2d")!.getImageData(0,0,480,326).data,12);setCamera(current);frame++;setRecordedFrames(frame);if(frame>=160)stopRecording()}catch{setGifError("Could not record this view. Try again.");stopRecording()}};
+   const timer=window.setInterval(tick,125);recordingJob.current={timer,gif,output};tick();
+  };
+  const exportClayPng=()=>{setSpinning(false);const outputCanvas=document.createElement("canvas");outputCanvas.width=1600;outputCanvas.height=1088;const output=createLoftRenderer(outputCanvas,true);try{output.draw(model,camera,thickness,false,false,clipEnabled?clip:null);const link=document.createElement("a");link.download=`sand-scan-reference-clay-${view.toLowerCase()}.png`;link.href=outputCanvas.toDataURL("image/png");link.click()}finally{output.dispose()}};
+  const chooseView=(name:string)=>{setSpinning(false);const iso:Record<string,number>={NW:-Math.PI/4,NE:Math.PI/4,SW:-3*Math.PI/4,SE:3*Math.PI/4};setView(name);setCamera({...initial,orthographic:name!=="perspective",...(name in iso?{yaw:iso[name],pitch:-Math.atan(1/Math.sqrt(2))}:name==="front"?{yaw:0,pitch:0}:name==="top"?{yaw:0,pitch:-Math.PI/2}:name==="right"?{yaw:Math.PI/2,pitch:0}:{})})};
+  return <article ref={renderNode} className="spatial-rational-node loft-render-node" style={{left:position.x,top:position.y}}>
+    <header onPointerDown={onDragStart}><div className="model-icon"><Sparkles size={19}/></div><div><h2>Circulation Loft Render</h2><p>Primary circulation loft → smooth spatial membrane</p></div><span>DRAG · ORBIT</span></header>
+    <div className="loft-render-toolbar" role="group" aria-label="Rendered loft view presets">{["perspective","front","top","right"].map(name=><button key={name} aria-pressed={view===name} onClick={()=>chooseView(name)}>{name}</button>)}</div>
+    <div className="loft-render-toolbar" role="group" aria-label="30/60 isometric views"><span>30/60 isometric</span>{["NW","NE","SW","SE"].map(name=><button key={name} aria-pressed={view===name} onClick={()=>chooseView(name)}>{name}</button>)}</div>
+    <div className="loft-render-toolbar" role="group" aria-label="360 degree model rotation"><button aria-pressed={spinning} disabled={model.rows.length<2||renderError} onClick={()=>{if(!spinning){setView("perspective");setCamera(current=>({...current,orthographic:false,pitch:Math.abs(current.pitch)>1.3?-.35:current.pitch}))}setSpinning(value=>!value)}}>{spinning?"Pause 360°":"Play 360°"}</button><span>Continuous turntable · 20 seconds per revolution</span></div>
+    <div className="rational-viewport"><canvas key={software?"software":"gpu"} ref={canvas} width={1000} height={680} aria-label="Smooth shaded three dimensional rendering of the primary circulation loft" onContextMenu={event=>event.preventDefault()} onPointerDown={event=>{setSpinning(false);event.currentTarget.setPointerCapture(event.pointerId);gesture.current={x:event.clientX,y:event.clientY,camera:{...camera},pan:event.shiftKey||event.button!==0}}} onPointerMove={event=>{const g=gesture.current;if(!g)return;const dx=event.clientX-g.x,dy=event.clientY-g.y;if(g.pan)setCamera({...g.camera,panX:g.camera.panX+dx*.007/g.camera.zoom,panY:g.camera.panY-dy*.007/g.camera.zoom});else{setView("perspective");setCamera({...g.camera,orthographic:false,yaw:g.camera.yaw+dx*.008,pitch:Math.max(-1.57,Math.min(1.57,g.camera.pitch+dy*.008))})}}} onPointerUp={()=>{gesture.current=null}} onPointerCancel={()=>{gesture.current=null}} onWheel={event=>{event.preventDefault();setCamera(c=>({...c,zoom:Math.max(.4,Math.min(3,c.zoom-event.deltaY*.0015))}))}}/>
+      <span>Drag to orbit · Shift-drag to pan · wheel to zoom</span><button onClick={()=>chooseView("perspective")}>Reset view</button>
+      {(model.rows.length===0||renderError)&&<div className="loft-render-empty">{renderError?"Rendered view unavailable in this browser.":"Select images and at least two primary circulations in the loft component."}</div>}
     </div>
-    <div className="rational-summary"><span><strong>1</strong>continuous floor system</span><span><strong>{plate.profiles.length}</strong>rail pairs</span><span><strong>{plate.cellCount}</strong>ruled faces</span><span><strong>{settings.surfaceFlow}%</strong>space expansion</span></div>
-    <p className="rational-note">Adjacent circulation lines are now the actual surface rails. Their corresponding section points are connected by straight rulings, producing floor plates that span between the cage-derived paths while retaining both rails’ height and curvature. No offset ribbon substitutes for the circulation lines, and no enclosure is added.</p>
-    <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
-  </article>;
-}
-
-function UnifiedRuledMeshPreview({slices,fidelity,primaryCount,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,smoothing,circulationSettings,floorSettings,heightInches,position,onDragStart}:{slices:Slice[];fidelity:number;primaryCount:number;offsetsPerPrimary:number;bifurcationsPerPrimary:number;bifurcationDistance:number;bifurcationScale:number;smoothing:number;circulationSettings:CirculationSettings;floorSettings:FloorPlateSettings;heightInches:number;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
-  const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null);
-  const [camera,setCamera]=useState({yaw:-.68,pitch:.32,zoom:1}),[meshOpacity,setMeshOpacity]=useState(88),[wireframe,setWireframe]=useState(true);
-  const meshSlices=useMemo(()=>{
-    if(!slices.length)return[] as Slice[];const center=(slices[0].z+slices.at(-1)!.z)/2,span=Math.max(.001,Math.abs(slices[0].z-slices.at(-1)!.z));
-    return slices.map(slice=>({...slice,z:(slice.z-center)/span*2.1}));
-  },[slices]);
-  const loops=useMemo(()=>meshSlices.map(slice=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,fidelity))),[meshSlices,fidelity]);
-  const families=useMemo(()=>longitudinalFamilies(meshSlices,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale,[],{}),[meshSlices,loops,primaryCount,smoothing,offsetsPerPrimary,bifurcationsPerPrimary,bifurcationDistance,bifurcationScale]);
-  const circulation=useMemo(()=>buildCirculationGeometry(families,circulationSettings,heightInches,bifurcationsPerPrimary),[families,circulationSettings,heightInches,bifurcationsPerPrimary]),plate=useMemo(()=>buildUnifiedFloorPlate(circulation,floorSettings),[circulation,floorSettings]);
-  useEffect(()=>{
-    const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;const width=c.width,height=c.height;ctx.fillStyle="#071014";ctx.fillRect(0,0,width,height);
-    if(!meshSlices.length){ctx.fillStyle="#8fa9ae";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select images to generate the unified ruled mesh",width/2,height/2);return}
-    const rotate=([x,y,z]:Vec):Vec=>{const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]},project=(point:Vec)=>{const [x,y,z]=rotate(point),perspective=5.4/(5.4+z),scale=205*camera.zoom*perspective;return{x:width*.5+x*scale,y:height*.54-y*scale,z}};
-    ctx.strokeStyle="rgba(55,90,105,.28)";ctx.lineWidth=.7;for(let i=-8;i<=8;i++){const a=project([i*.25,circulation.floorY,-CHUNK_HALF]),b=project([i*.25,circulation.floorY,CHUNK_HALF]),d=project([-CHUNK_HALF,circulation.floorY,i*.25]),e=project([CHUNK_HALF,circulation.floorY,i*.25]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);ctx.stroke()}
-    const cells=plate.profiles.flatMap(route=>route.slice(0,-1).map((profile,index)=>{const screen=[profile[0],route[index+1][0],route[index+1][1],profile[1]].map(project);return{screen,depth:screen.reduce((sum,p)=>sum+p.z,0)/4}})).sort((a,b)=>b.depth-a.depth);
-    cells.forEach(cell=>{const depthTone=Math.max(0,Math.min(1,(cell.depth+2.2)/4.4)),alpha=.22+meshOpacity/100*.62;ctx.fillStyle=`rgba(${Math.round(40+depthTone*32)},${Math.round(148+depthTone*76)},${Math.round(150+depthTone*67)},${alpha})`;ctx.strokeStyle=wireframe?`rgba(181,255,246,${.18+meshOpacity/100*.5})`:"transparent";ctx.lineWidth=.55;ctx.beginPath();ctx.moveTo(cell.screen[0].x,cell.screen[0].y);for(let i=1;i<4;i++)ctx.lineTo(cell.screen[i].x,cell.screen[i].y);ctx.closePath();ctx.fill();if(wireframe)ctx.stroke()});
-    const draw=(line:Vec[],color:string,widthValue:number)=>{const pts=line.map(project);if(pts.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=widthValue;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(let i=1;i<pts.length-1;i++){const mid={x:(pts[i].x+pts[i+1].x)/2,y:(pts[i].y+pts[i+1].y)/2};ctx.quadraticCurveTo(pts[i].x,pts[i].y,mid.x,mid.y)}ctx.lineTo(pts.at(-1)!.x,pts.at(-1)!.y);ctx.stroke()};
-    if(wireframe)circulation.ribbons.forEach(ribbon=>draw(ribbon.center,ribbon.kind==="spine"?"rgba(202,255,247,.9)":"rgba(255,178,91,.92)",ribbon.kind==="spine"?1.25:1));
-    ctx.fillStyle="#8aa9ae";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`20′ × 20′ · ${heightInches/12}′ HIGH · ONE FLOOR · ${cells.length} RATIONALIZED FACES`,14,20);
-  },[meshSlices,plate,circulation,camera,meshOpacity,wireframe,heightInches]);
-  return <article className="spatial-chunk-node" style={{left:position.x,top:position.y}}>
-    <header onPointerDown={onDragStart}><div className="model-icon"><Box size={19}/></div><div><h2>Unified Ruled Mesh</h2><p>3D ruled floor plates → continuous quad mesh</p></div><span>DRAG · 3D MESH</span></header>
-    <div className="chunk-viewport"><canvas ref={canvas} width={760} height={430} aria-label="Rotatable 3D preview of the unified ruled surface mesh" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.68,pitch:.32,zoom:1})}>Reset view</button><label><span>Mesh opacity</span><input type="range" min="10" max="100" value={meshOpacity} onChange={event=>setMeshOpacity(Number(event.target.value))}/><strong>{meshOpacity}%</strong></label></div>
-    <div className="spatial-constraint-band mesh-constraint"><strong>20′ × 20′</strong><span>{heightInches/12}′ adjustable height</span><span>1 occupiable floor</span><span>Trimmed envelope</span></div>
-    <div className="geometry-mode"><span>Mesh display</span><div><button className={!wireframe?"active":""} onClick={()=>setWireframe(false)}>Shaded</button><button className={wireframe?"active":""} onClick={()=>setWireframe(true)}>Shaded + edges</button></div><small>Ruled floor surfaces preserve circulation height · no enclosure</small></div>
-    <div className="chunk-summary"><span><strong>1</strong>floor plate</span><span><strong>{circulation.ribbons.length}</strong>circulation bands</span><span><strong>{plate.profiles.length}</strong>rail pairs</span><span><strong>{plate.cellCount}</strong>plate faces</span></div>
+    <div className="loft-render-toolbar" role="group" aria-label="Animated GIF export"><button disabled={recording||model.rows.length<2||renderError} onClick={recordGif}>Record GIF</button><button disabled={!recording} onClick={stopRecording}>Stop &amp; export GIF</button><span aria-live="polite">{recording?`Recording · ${recordedFrames} frames`:"480 × 326 · one rotation · stops automatically after 160 frames"}</span>{gifError&&<p role="alert">{gifError}</p>}</div>
+    <div className="loft-render-toolbar"><button disabled={model.rows.length<2||renderError} onClick={exportClayPng}><Download size={14} style={{verticalAlign:"middle",marginRight:6}}/>Export Clay PNG</button><span>Current viewport · 1600 × 1088</span></div>
+    <div className="loft-render-toolbar" role="group" aria-label="Loft render material"><button aria-pressed={!blue} onClick={()=>setBlue(false)}>Reference clay</button><button aria-pressed={blue} onClick={()=>setBlue(true)}>Primary blue</button><button aria-pressed={showRails} onClick={()=>setShowRails(value=>!value)}>Primary rails {showRails?"on":"off"}</button></div>
+    <div className="rational-controls"><label><span>Membrane thickness</span><strong>{thickness}″</strong><input type="range" min="0" max="12" step=".5" value={thickness} onChange={event=>setThickness(Number(event.target.value))}/><small>Thickness shared by the render and Rhino export</small></label><label><span>View scale</span><strong>{camera.zoom.toFixed(2)}×</strong><input type="range" min=".4" max="3" step=".05" value={camera.zoom} onChange={event=>setCamera(c=>({...c,zoom:Number(event.target.value)}))}/><small>Frame the spatial chunk</small></label></div>
+    <div className="loft-render-toolbar"><button aria-pressed={clipEnabled} onClick={()=>setClipEnabled(value=>!value)}>Clipping plane {clipEnabled?"on":"off"}</button></div>
+    <div className="rational-controls"><label style={{gridColumn:"1/-1"}}><span>Front-to-back clipping plane</span><strong>{clip}%</strong><input aria-label="Front-to-back clipping plane" type="range" min="0" max="100" step="1" value={clip} disabled={!clipEnabled} onChange={event=>setClip(Number(event.target.value))}/><small>Front → back · pink lines show the cut · orbit to inspect inside</small></label></div>
+    <p className="rational-note">The connected loft’s flat floor bands and curved transitions are rendered with overhead lighting on a black background. Clipping removes geometry from the front toward the back. Change the loft sliders to update this view. Membrane thickness is shared with Rhino Export. Clipping is view-only; the full loft is exported.</p>
+    <span className="space-output-port" aria-hidden="true"/>
     <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
   </article>;
 }
@@ -744,9 +750,9 @@ function ReadOnlyBoundaryLinesPreview({slices,activeIndex,fidelity,setFidelity,p
     ctx.strokeStyle="rgba(67,98,103,.26)";ctx.lineWidth=.7;for(let i=-7;i<=7;i++){const a=project([i*.38,-1.03,zCenter-2.8]),b=project([i*.38,-1.03,zCenter+2.8]),d=project([-2.8,-1.03,zCenter+i*.38]),e=project([2.8,-1.03,zCenter+i*.38]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);ctx.stroke()}
     const rendered=loops.flatMap((section,index)=>section.map(loop=>({index,points:loop.map(([x,y])=>[(x/(W-1)-.5)*2.25,(.5-y/(H-1))*1.7,slices[index].z] as Vec)}))).map(item=>({...item,depth:item.points.reduce((sum,point)=>sum+rotate(point)[2],0)/Math.max(1,item.points.length)})).sort((a,b)=>b.depth-a.depth);
     rendered.forEach(item=>{const active=item.index===activeIndex;ctx.strokeStyle=active?"rgba(155,235,224,.68)":"rgba(82,136,137,.22)";ctx.lineWidth=active?1.35:.62;ctx.beginPath();item.points.forEach((point,index)=>{const p=project(point);index?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});ctx.stroke()});
-    if(ruledSurfaces)[...families.ruled,...families.branchPlates].forEach(strip=>{const count=Math.min(strip.a.length,strip.b.length),branch=families.branchPlates.includes(strip);for(let index=0;index<count-1;index++){const a=project(strip.a[index]),b=project(strip.b[index]),c=project(strip.b[index+1]),d=project(strip.a[index+1]);ctx.fillStyle=branch?"rgba(242,151,72,.3)":"rgba(95,231,218,.12)";ctx.strokeStyle=branch?"rgba(255,203,127,.7)":"rgba(95,231,218,.18)";ctx.lineWidth=branch ? .55 : .45;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(d.x,d.y);ctx.closePath();ctx.fill();ctx.stroke()}});
+    if(ruledSurfaces)[...families.ruled,...families.branchPlates].forEach(strip=>{const count=Math.min(strip.a.length,strip.b.length),branch=families.branchPlates.includes(strip);for(let index=0;index<count-1;index++){const a=project(strip.a[index]),b=project(strip.b[index]),c=project(strip.b[index+1]),d=project(strip.a[index+1]);ctx.fillStyle=branch?viewportColor("tertiary",.3):viewportColor("primary",.12);ctx.strokeStyle=branch?viewportColor("tertiary",.7):viewportColor("primary",.18);ctx.lineWidth=branch ? .55 : .45;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(d.x,d.y);ctx.closePath();ctx.fill();ctx.stroke()}});
     const draw=(lines:Vec[][],color:string,width:number,glow=0)=>lines.forEach(line=>{const points=line.map(project);if(points.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=width;ctx.shadowColor=color;ctx.shadowBlur=glow;ctx.beginPath();ctx.moveTo(points[0].x,points[0].y);for(let i=1;i<points.length-1;i++){const midpoint={x:(points[i].x+points[i+1].x)/2,y:(points[i].y+points[i+1].y)/2};ctx.quadraticCurveTo(points[i].x,points[i].y,midpoint.x,midpoint.y)}ctx.lineTo(points.at(-1)!.x,points.at(-1)!.y);ctx.stroke();ctx.shadowBlur=0});
-    draw(families.offset,"rgba(211,109,224,.54)",.85);draw(families.primary,"rgba(95,231,218,.92)",1.55,3);draw(families.branches,"rgba(255,184,97,.85)",1.15,2);
+    draw(families.offset,viewportColor("secondary",.54),.85);draw(families.primary,viewportColor("primary",.92),1.55,3);draw(families.branches,viewportColor("tertiary",.85),1.15,2);
     families.anchors.forEach(({point})=>{const p=project(point);ctx.fillStyle="#d7fff8";ctx.beginPath();ctx.arc(p.x,p.y,1.35,0,Math.PI*2);ctx.fill()});
     ctx.fillStyle="#739396";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`TRANSVERSE CAGE · SECTION ${activeIndex+1} / ${slices.length}`,14,20);ctx.textAlign="right";ctx.fillText(`${pointCount} EXTRACTED POINTS`,width-14,20);
   },[slices,loops,families,activeIndex,pointCount,camera,ruledSurfaces]);
@@ -803,17 +809,17 @@ function BoundaryLinesPreview({slices,activeIndex,fidelity,setFidelity,primaryCo
     const rendered=loops.flatMap((section,index)=>section.map(loop=>({index,points:loop.map(([x,y])=>[(x/(W-1)-.5)*2.25,(.5-y/(H-1))*1.7,slices[index].z] as Vec)}))).map(item=>({...item,depth:item.points.reduce((sum,point)=>sum+rotate(point)[2],0)/Math.max(1,item.points.length)})).sort((a,b)=>b.depth-a.depth);
     // Transverse boundaries remain visible as a restrained reference cage.
     rendered.forEach(item=>{const active=item.index===activeIndex;ctx.strokeStyle=active?"rgba(155,235,224,.68)":"rgba(82,136,137,.22)";ctx.lineWidth=active?1.35:.62;ctx.beginPath();item.points.forEach((point,index)=>{const p=project(point);if(index===0)ctx.moveTo(p.x,p.y);else ctx.lineTo(p.x,p.y)});ctx.stroke()});
-    if(ruledSurfaces)families.ruled.forEach(strip=>{const count=Math.min(strip.a.length,strip.b.length);for(let index=0;index<count-1;index++){const a=project(strip.a[index]),b=project(strip.b[index]),c=project(strip.b[index+1]),d=project(strip.a[index+1]);ctx.fillStyle=strip.kind==="void"?"rgba(255,181,91,.16)":"rgba(95,231,218,.12)";ctx.strokeStyle=strip.kind==="void"?"rgba(255,181,91,.24)":"rgba(95,231,218,.18)";ctx.lineWidth=.45;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(d.x,d.y);ctx.closePath();ctx.fill();ctx.stroke()}});
-    if(ruledSurfaces)families.branchPlates.forEach(strip=>{const count=Math.min(strip.a.length,strip.b.length);for(let index=0;index<count-1;index++){const a=project(strip.a[index]),b=project(strip.b[index]),c=project(strip.b[index+1]),d=project(strip.a[index+1]);ctx.fillStyle="rgba(242,151,72,.3)";ctx.strokeStyle="rgba(255,203,127,.7)";ctx.lineWidth=.55;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(d.x,d.y);ctx.closePath();ctx.fill();ctx.stroke()}});
+    if(ruledSurfaces)families.ruled.forEach(strip=>{const count=Math.min(strip.a.length,strip.b.length);for(let index=0;index<count-1;index++){const a=project(strip.a[index]),b=project(strip.b[index]),c=project(strip.b[index+1]),d=project(strip.a[index+1]);ctx.fillStyle=strip.kind==="void"?viewportColor("secondary",.16):viewportColor("primary",.12);ctx.strokeStyle=strip.kind==="void"?viewportColor("secondary",.24):viewportColor("primary",.18);ctx.lineWidth=.45;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(d.x,d.y);ctx.closePath();ctx.fill();ctx.stroke()}});
+    if(ruledSurfaces)families.branchPlates.forEach(strip=>{const count=Math.min(strip.a.length,strip.b.length);for(let index=0;index<count-1;index++){const a=project(strip.a[index]),b=project(strip.b[index]),c=project(strip.b[index+1]),d=project(strip.a[index+1]);ctx.fillStyle=viewportColor("tertiary",.3);ctx.strokeStyle=viewportColor("tertiary",.7);ctx.lineWidth=.55;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(d.x,d.y);ctx.closePath();ctx.fill();ctx.stroke()}});
     const drawFamily=(lines:Vec[][],color:string,widthValue:number,glow=0)=>lines.forEach(line=>{
       const points=line.map(project);if(points.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=widthValue;ctx.shadowColor=color;ctx.shadowBlur=glow;ctx.beginPath();ctx.moveTo(points[0].x,points[0].y);
       for(let i=1;i<points.length-1;i++){const midpoint={x:(points[i].x+points[i+1].x)/2,y:(points[i].y+points[i+1].y)/2};ctx.quadraticCurveTo(points[i].x,points[i].y,midpoint.x,midpoint.y)}
       ctx.lineTo(points.at(-1)!.x,points.at(-1)!.y);ctx.stroke();ctx.shadowBlur=0;
     });
-    drawFamily(families.tweens,"rgba(118,153,166,.25)",.62);drawFamily(families.offset,"rgba(211,109,224,.54)",.85);
-    families.primary.forEach((line,index)=>{const role=families.primaryRoles[index],color=role.startsWith("ground")?"rgba(114,203,255,.95)":role.startsWith("void")||role.startsWith("threshold")?"rgba(255,181,91,.96)":role==="ridge"?"rgba(255,110,207,.96)":"rgba(95,231,218,.92)";drawFamily([line],color,1.55,3)});
+    drawFamily(families.tweens,viewportColor("secondary",.25),.62);drawFamily(families.offset,viewportColor("secondary",.54),.85);
+    families.primary.forEach(line=>drawFamily([line],viewportColor("primary",.95),1.55,3));
     branchHitRef.current=families.branches.map((line,index)=>({index,points:line.map(project)}));
-    families.branches.forEach((line,index)=>drawFamily([line],index===selectedBranch?"rgba(108,244,232,.98)":"rgba(255,184,97,.85)",index===selectedBranch?2.1:1.15,index===selectedBranch?5:2));
+    families.branches.forEach((line,index)=>drawFamily([line],index===selectedBranch?viewportColor("tertiary",1):viewportColor("tertiary",.85),index===selectedBranch?2.1:1.15,index===selectedBranch?5:2));
     if(expanded)branchHitRef.current.forEach(branch=>branch.points.forEach((point,index)=>{const selected=branch.index===selectedBranch&&index===selectedPoint;ctx.fillStyle=selected?"#ffffff":"rgba(255,205,139,.88)";ctx.strokeStyle=selected?"#6cf4e8":"#513a20";ctx.lineWidth=selected?3:1.2;ctx.beginPath();ctx.arc(point.x,point.y,selected?7:3.5,0,Math.PI*2);ctx.fill();ctx.stroke()}));
     const selectedWorld=families.branches[selectedBranch]?.[selectedPoint],selectedScreen=selectedWorld?project(selectedWorld):null;gumballRef.current=null;
     if(expanded&&selectedWorld&&selectedScreen){const worldAxes:[0|1|2,Vec,string,string][]= [[0,[selectedWorld[0]+.42,selectedWorld[1],selectedWorld[2]],"#e96060","X"],[1,[selectedWorld[0],selectedWorld[1]+.42,selectedWorld[2]],"#65c878","Y"],[2,[selectedWorld[0],selectedWorld[1],selectedWorld[2]+.42],"#5f8ee8","Z"]],axes:{axis:0|1|2;end:{x:number;y:number}}[]=[];worldAxes.forEach(([axis,worldEnd,color,label])=>{const end=project(worldEnd),dx=end.x-selectedScreen.x,dy=end.y-selectedScreen.y,length=Math.max(1,Math.hypot(dx,dy)),ux=dx/length,uy=dy/length,px=-uy,py=ux;ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(selectedScreen.x,selectedScreen.y);ctx.lineTo(end.x,end.y);ctx.stroke();ctx.beginPath();ctx.moveTo(end.x,end.y);ctx.lineTo(end.x-ux*12+px*6,end.y-uy*12+py*6);ctx.lineTo(end.x-ux*12-px*6,end.y-uy*12-py*6);ctx.closePath();ctx.fill();ctx.font="bold 12px sans-serif";ctx.fillText(label,end.x+px*8,end.y+py*8);axes.push({axis,end})});ctx.fillStyle="#f5fbff";ctx.strokeStyle="#17323a";ctx.lineWidth=2;ctx.beginPath();ctx.arc(selectedScreen.x,selectedScreen.y,8,0,Math.PI*2);ctx.fill();ctx.stroke();gumballRef.current={origin:selectedScreen,axes}}
@@ -871,7 +877,7 @@ function BoundaryLinesPreview({slices,activeIndex,fidelity,setFidelity,primaryCo
           <label><span>Cage fidelity</span><strong>{fidelity}%</strong><input type="range" min="10" max="100" step="2" value={fidelity} onChange={event=>setFidelity(Number(event.target.value))}/><small>Simplified + smooth</small><small>Boundary accurate</small></label>
         </div>
         <div className="architectural-anchor-key" aria-label="Primary and offset line logic"><span><i className="extent"/>Dominant perimeter</span><span><i className="ridge"/>Primary lines</span><span><i className="void"/>Offset lines</span><span><i className="ground"/>Shared section order</span></div>
-        <p>{expanded?"Every orange control point is selectable. The red, green, and blue gumball arrows translate the active point along world X, Y, and Z; the adjacent curve and floor plate rebuild around that edited point. Ctrl+Z and Ctrl+Y move through the last ten point translations.":"Double-click this component to open the full-screen cage editor and translate individual curve points in a standard perspective viewport."}</p>
+        <p>{expanded?"Every orange control point is selectable. The red, green, and blue gumball arrows translate the active point along world X, Y, and Z; the adjacent curve and downstream ridge geometry rebuild around that edited point. Ctrl+Z and Ctrl+Y move through the last ten point translations.":"Double-click this component to open the full-screen cage editor and translate individual curve points in a standard perspective viewport."}</p>
       </aside>
     </div>
     <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
@@ -891,14 +897,14 @@ function GridRationalizationPreview({slices,gridSize,alignment,setGridSize,setAl
     for(let x=-1.25;x<=1.26;x+=unit){const a=project([x,-1.02,zCenter-2.7]),b=project([x,-1.02,zCenter+2.7]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke()}
     for(let z=zCenter-2.7;z<=zCenter+2.71;z+=unit){const a=project([-1.35,-1.02,z]),b=project([1.35,-1.02,z]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke()}
     const rendered=loops.flatMap((section,index)=>section.map(loop=>({index,points:loop.map(([x,y])=>[(x/(W-1)-.5)*2.25,(.5-y/(H-1))*1.7,slices[index].z] as Vec)}))).map(item=>({...item,depth:item.points.reduce((sum,p)=>sum+rotate(p)[2],0)/Math.max(1,item.points.length)})).sort((a,b)=>b.depth-a.depth);
-    rendered.forEach(item=>{ctx.strokeStyle=item.index%4===0?"#aaf7eb":"rgba(112,205,197,.55)";ctx.lineWidth=item.index%4===0?1.5:.85;ctx.beginPath();item.points.forEach((point,index)=>{const p=project(point);index?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});ctx.stroke()});
+    rendered.forEach(item=>{ctx.strokeStyle=item.index%4===0?VIEWPORT_PRIMARY:viewportColor("primary",.55);ctx.lineWidth=item.index%4===0?1.5:.85;ctx.beginPath();item.points.forEach((point,index)=>{const p=project(point);index?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});ctx.stroke()});
     ctx.fillStyle="#83aeb2";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText(`GRID ${gridSize} CELLS · ALIGNMENT ${alignment}%`,14,20);
   },[slices,loops,gridSize,alignment,camera]);
   return <article className="grid-rationalization-node" style={{left:position.x,top:position.y}}>
     <header onPointerDown={onDragStart}><div className="model-icon"><Grid3X3 size={19}/></div><div><h2>Grid Rationalization</h2><p>CT volume → ordered section framework</p></div><span>DRAG · GRID</span></header>
     <div className="grid-viewport"><canvas ref={canvas} width={620} height={350} aria-label="Rotatable 3D preview of grid-aligned section curves" onPointerDown={event=>{event.currentTarget.setPointerCapture(event.pointerId);orbit.current={x:event.clientX,y:event.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={event=>{const start=orbit.current;if(start)setCamera(value=>({...value,yaw:start.yaw+(event.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(event.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={event=>{event.preventDefault();setCamera(value=>({...value,zoom:Math.max(.55,Math.min(2.2,value.zoom-event.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.72,pitch:.38,zoom:1})}>Reset view</button></div>
     <div className="grid-controls"><label><span>Grid spacing</span><strong>{gridSize} cells</strong><input type="range" min="4" max="16" step="1" value={gridSize} onChange={event=>setGridSize(Number(event.target.value))}/><small>Fine order</small><small>Broad modules</small></label><label><span>Grid alignment</span><strong>{alignment}%</strong><input type="range" min="0" max="100" step="2" value={alignment} onChange={event=>setAlignment(Number(event.target.value))}/><small>Original curves</small><small>Orthogonal order</small></label></div>
-    <p>Exterior and void boundaries are pulled toward one shared grid, then relaxed so adjacent sections blend continuously. This rationalized geometry now feeds the Unified Section Cage before its primary and offset lines generate the ruled mesh.</p>
+    <p>Exterior and void boundaries are pulled toward one shared grid, then relaxed so adjacent sections blend continuously. This rationalized geometry now feeds the Unified Section Cage before its primary and offset lines guide circulation.</p>
     <span className="port port-left port-ct-in" aria-hidden="true"/><span className="port port-right port-cage-out" aria-hidden="true"/>
   </article>;
 }
@@ -921,7 +927,7 @@ function RealityNode({slices,settings,setSettings,position,onDragStart}:{slices:
     // Supports read as a structural frame tied directly to the ground plane.
     const span=Math.max(.35,settings.supportSpacing/28);ctx.strokeStyle="#e3b96f";ctx.lineWidth=1.5;for(let x=-1.05;x<=1.06;x+=span){const a=project([x,-.77,zCenter-1.25]),b=project([x,.42,zCenter-1.25]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke()}
     // A continuous circulation trace passes through the threshold sequence.
-    ctx.strokeStyle="#ff785e";ctx.lineWidth=2.4;ctx.shadowColor="#ff785e";ctx.shadowBlur=6;ctx.beginPath();slices.forEach((slice,index)=>{const q=project([0,-.48,slice.z]);index?ctx.lineTo(q.x,q.y):ctx.moveTo(q.x,q.y)});ctx.stroke();ctx.shadowBlur=0;
+    ctx.strokeStyle=VIEWPORT_PRIMARY;ctx.lineWidth=2.4;ctx.shadowColor=VIEWPORT_PRIMARY;ctx.shadowBlur=6;ctx.beginPath();slices.forEach((slice,index)=>{const q=project([0,-.48,slice.z]);index?ctx.lineTo(q.x,q.y):ctx.moveTo(q.x,q.y)});ctx.stroke();ctx.shadowBlur=0;
     ctx.fillStyle="#8ca9aa";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText("GROUND DATUM · SINGLE FLOOR · SUPPORTS · FLOW",14,20);
   },[slices,settings,camera]);
   const update=(key:keyof RealitySettings,value:number)=>setSettings(current=>({...current,[key]:value}));
@@ -938,111 +944,74 @@ function RealityNode({slices,settings,setSettings,position,onDragStart}:{slices:
   </article>;
 }
 
-function ExportGeometryPreview({slices,exportHeight,position,onDragStart}:{slices:Slice[];exportHeight:number;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
-  const canvas=useRef<HTMLCanvasElement>(null);
-  const orbit=useRef<{x:number;y:number;yaw:number;pitch:number}|null>(null);
-  const [camera,setCamera]=useState({yaw:-.72,pitch:.38,zoom:1});
-  const [layers,setLayers]=useState({mesh:true,sections:true,boundaries:true});
-  useEffect(()=>{
-    const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;
-    const width=c.width,height=c.height;ctx.clearRect(0,0,width,height);
-    const background=ctx.createLinearGradient(0,0,0,height);background.addColorStop(0,"#565c60");background.addColorStop(.55,"#343a3e");background.addColorStop(1,"#202529");ctx.fillStyle=background;ctx.fillRect(0,0,width,height);
-    if(!slices.length){ctx.fillStyle="#8fa4a6";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select depth sections to preview the Rhino export",width/2,height/2);return}
-    const nx=44,ny=34,nz=slices.length,threshold=.32,zCenter=exportHeight*.5;
-    const filled=Array.from({length:nz},(_,z)=>Array.from({length:ny},(_,y)=>Array.from({length:nx},(_,x)=>slices[z].field[Math.round((y+.5)*(H-1)/ny)*W+Math.round((x+.5)*(W-1)/nx)]>=threshold)));
-    const centers=Array.from({length:nz},(_,index)=>exportDepth(slices,index,exportHeight)),zBounds=Array.from({length:nz+1},(_,index)=>nz===1?index*exportHeight:index===0?0:index===nz?exportHeight:(centers[index-1]+centers[index])*.5),world=(x:number,y:number,z:number):Vec=>[(x/nx-.5)*EXPORT_TILE_INCHES,(.5-y/ny)*EXPORT_TILE_INCHES,zBounds[z]];
-    const rotate=([x,y,z]:Vec):Vec=>{z-=zCenter;const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch),rx=x*cy+z*sy,rz=-x*sy+z*cy;return[rx,y*cp-rz*sp,y*sp+rz*cp]};
-    const extent=Math.max(EXPORT_TILE_INCHES,exportHeight),project=(point:Vec)=>{const [x,y,z]=rotate(point),distance=extent*2.5,perspective=distance/(distance+z),scale=Math.min(width,height)*.72/extent*camera.zoom*perspective;return{x:width*.5+x*scale,y:height*.52-y*scale,z}};
-    ctx.strokeStyle="rgba(196,205,209,.18)";ctx.lineWidth=.7;for(let i=0;i<=10;i++){const v=-10+i*2,a=project([v,-10,0]),b=project([v,10,0]),d=project([-10,v,0]),e=project([10,v,0]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.beginPath();ctx.moveTo(d.x,d.y);ctx.lineTo(e.x,e.y);ctx.stroke()}
-    type Face={points:Vec[];tone:"outer"|"void"|"cap"};const faces:Face[]=[],isFilled=(x:number,y:number,z:number)=>z>=0&&z<nz&&y>=0&&y<ny&&x>=0&&x<nx&&filled[z][y][x],push=(points:[number,number,number][],tone:Face["tone"])=>faces.push({points:points.map(([x,y,z])=>world(x,y,z)),tone});
-    for(let z=0;z<nz;z++)for(let y=0;y<ny;y++)for(let x=0;x<nx;x++){if(!filled[z][y][x])continue;
-      if(!isFilled(x-1,y,z))push([[x,y,z],[x,y+1,z],[x,y+1,z+1],[x,y,z+1]],x===0?"outer":"void");
-      if(!isFilled(x+1,y,z))push([[x+1,y,z],[x+1,y,z+1],[x+1,y+1,z+1],[x+1,y+1,z]],x===nx-1?"outer":"void");
-      if(!isFilled(x,y-1,z))push([[x,y,z],[x,y,z+1],[x+1,y,z+1],[x+1,y,z]],y===0?"outer":"void");
-      if(!isFilled(x,y+1,z))push([[x,y+1,z],[x+1,y+1,z],[x+1,y+1,z+1],[x,y+1,z+1]],y===ny-1?"outer":"void");
-      if(!isFilled(x,y,z-1))push([[x,y,z],[x+1,y,z],[x+1,y+1,z],[x,y+1,z]],"cap");
-      if(!isFilled(x,y,z+1))push([[x,y,z+1],[x,y+1,z+1],[x+1,y+1,z+1],[x+1,y,z+1]],"cap");
-    }
-    const rendered=faces.map(face=>({face,rotated:face.points.map(rotate),screen:face.points.map(project)})).sort((a,b)=>b.rotated.reduce((n,p)=>n+p[2],0)-a.rotated.reduce((n,p)=>n+p[2],0));
-    if(layers.mesh)rendered.forEach(item=>{const a=item.rotated[0],b=item.rotated[1],d=item.rotated[3],ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2],vx=d[0]-a[0],vy=d[1]-a[1],vz=d[2]-a[2],nxv=uy*vz-uz*vy,nyv=uz*vx-ux*vz,nzv=ux*vy-uy*vx,len=Math.hypot(nxv,nyv,nzv)||1,light=Math.max(.08,Math.abs(nxv*-.35+nyv*.82+nzv*-.45)/len),shade=Math.round(76+light*150);ctx.globalAlpha=.78;ctx.fillStyle=item.face.tone==="void"?`rgb(${20+Math.round(light*22)},${31+Math.round(light*30)},${35+Math.round(light*34)})`:item.face.tone==="cap"?`rgb(${Math.round(shade*.68)},${Math.round(shade*.74)},${Math.round(shade*.76)})`:`rgb(${Math.min(226,shade)},${Math.min(234,shade+7)},${Math.min(236,shade+10)})`;ctx.beginPath();ctx.moveTo(item.screen[0].x,item.screen[0].y);for(let i=1;i<4;i++)ctx.lineTo(item.screen[i].x,item.screen[i].y);ctx.closePath();ctx.fill()});ctx.globalAlpha=1;
-    // Layer 02: every exported planar section surface, shown as a translucent
-    // baked object at its exact Rhino depth.
-    let sectionFaces=0;
-    if(layers.sections){ctx.fillStyle="rgba(242,105,82,.055)";ctx.strokeStyle="rgba(255,139,105,.14)";ctx.lineWidth=.32;for(let z=0;z<nz;z++)for(let y=0;y<ny;y++)for(let x=0;x<nx;x++){if(!filled[z][y][x])continue;sectionFaces++;const depth=centers[z],points:[Vec,Vec,Vec,Vec]=[[(x/nx-.5)*EXPORT_TILE_INCHES,(.5-y/ny)*EXPORT_TILE_INCHES,depth],[((x+1)/nx-.5)*EXPORT_TILE_INCHES,(.5-y/ny)*EXPORT_TILE_INCHES,depth],[((x+1)/nx-.5)*EXPORT_TILE_INCHES,(.5-(y+1)/ny)*EXPORT_TILE_INCHES,depth],[(x/nx-.5)*EXPORT_TILE_INCHES,(.5-(y+1)/ny)*EXPORT_TILE_INCHES,depth]],screen=points.map(project);ctx.beginPath();ctx.moveTo(screen[0].x,screen[0].y);for(let i=1;i<4;i++)ctx.lineTo(screen[i].x,screen[i].y);ctx.closePath();ctx.fill();ctx.stroke()}}
-    // Layer 03: all joined exterior and internal-void boundaries are drawn as
-    // baked Rhino curves over the composite surface set.
-    let boundaryCount=0;
-    if(layers.boundaries){ctx.strokeStyle="rgba(109,244,226,.72)";ctx.lineWidth=.72;slices.forEach((slice,index)=>sectionContourLoops(slice.field).map(loop=>contourFidelity(loop,76)).forEach(loop=>{boundaryCount++;ctx.beginPath();loop.forEach(([x,y],pointIndex)=>{const point=project([(x/(W-1)-.5)*EXPORT_TILE_INCHES,(.5-y/(H-1))*EXPORT_TILE_INCHES,centers[index]]);pointIndex?ctx.lineTo(point.x,point.y):ctx.moveTo(point.x,point.y)});ctx.stroke()}))}
-    ctx.strokeStyle="#8bd9cf";ctx.lineWidth=1.1;const tile=[project([-10,-10,0]),project([10,-10,0]),project([10,10,0]),project([-10,10,0])];ctx.beginPath();tile.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.closePath();ctx.stroke();
-    ctx.fillStyle="#d8e0e2";ctx.font="11px sans-serif";ctx.textAlign="left";ctx.fillText(`${faces.length} mesh faces · ${sectionFaces} section cells · ${boundaryCount} curves`,16,height-16);
-  },[slices,camera,exportHeight,layers]);
-  const toggleLayer=(key:keyof typeof layers)=>setLayers(current=>({...current,[key]:!current[key]}));
-  return <article className="subd-preview-node" style={{left:position.x,top:position.y}}>
-    <header onPointerDown={onDragStart}><div className="model-icon"><Sparkles size={19}/></div><div><h2>Baked Rhino Geometry Preview</h2><p>All exported layers · combined Rhino viewport</p></div><span>DRAG · LIVE</span></header>
-    <div className="subd-viewport"><canvas ref={canvas} width={500} height={360} aria-label="Interactive preview showing the watertight mesh, all section surfaces, and all boundary curves baked together in Rhino. Drag to orbit and use the mouse wheel to zoom." onPointerDown={e=>{e.currentTarget.setPointerCapture(e.pointerId);orbit.current={x:e.clientX,y:e.clientY,yaw:camera.yaw,pitch:camera.pitch}}} onPointerMove={e=>{const start=orbit.current;if(start)setCamera(v=>({...v,yaw:start.yaw+(e.clientX-start.x)*.01,pitch:Math.max(-1.25,Math.min(1.25,start.pitch+(e.clientY-start.y)*.008))}))}} onPointerUp={()=>{orbit.current=null}} onPointerCancel={()=>{orbit.current=null}} onWheel={e=>{e.preventDefault();setCamera(v=>({...v,zoom:Math.max(.55,Math.min(2.2,v.zoom-e.deltaY*.0012))}))}}/><span>Drag to orbit · wheel to zoom</span><button onClick={()=>setCamera({yaw:-.72,pitch:.38,zoom:1})}>Reset view</button></div>
-    <div className="spatial-constraint-band compact"><strong>20′ × 20′</strong><span>{exportHeight/12}′ high</span><span>1 floor</span><span>Trimmed</span></div>
-    <div className="baked-layer-controls"><button className={layers.mesh?"active":""} onClick={()=>toggleLayer("mesh")} aria-pressed={layers.mesh}><i className="mesh"/>Printable SubD mesh</button><button className={layers.sections?"active":""} onClick={()=>toggleLayer("sections")} aria-pressed={layers.sections}><i className="sections"/>Section surfaces</button><button className={layers.boundaries?"active":""} onClick={()=>toggleLayer("boundaries")} aria-pressed={layers.boundaries}><i className="boundaries"/>Boundary curves</button></div>
-    <div className="subd-preview-meta"><span>RHINO LAYERS 01–03 · ALL GEOMETRY BAKED</span><strong>Composite export preview</strong><p>The single-floor ruled form, reference sections, and boundary curves are displayed inside the 20′ × 20′ × {exportHeight/12}′ envelope; geometry beyond it is removed.</p></div>
-    <span className="port port-left" aria-hidden="true"/><span className="port port-right" aria-hidden="true"/>
-  </article>;
-}
-
-function FrontClipPreview({slices,heightInches,position,onDragStart}:{slices:Slice[];heightInches:number;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
-  const canvas=useRef<HTMLCanvasElement>(null);
-  const [clip,setClip]=useState(50);
-  const clipIndex=Math.round(clip/100*Math.max(0,slices.length-1));
-  useEffect(()=>{
-    const c=canvas.current,ctx=c?.getContext("2d");if(!c||!ctx)return;
-    const width=c.width,height=c.height;ctx.clearRect(0,0,width,height);
-    const bg=ctx.createLinearGradient(0,0,0,height);bg.addColorStop(0,"#4b5155");bg.addColorStop(1,"#22272a");ctx.fillStyle=bg;ctx.fillRect(0,0,width,height);
-    ctx.strokeStyle="rgba(205,215,218,.14)";ctx.lineWidth=1;
-    for(let x=18;x<width;x+=24){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,height);ctx.stroke()}
-    for(let y=18;y<height;y+=24){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(width,y);ctx.stroke()}
-    if(!slices.length){ctx.fillStyle="#a7b3b6";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("Select depth sections to clip",width/2,height/2);return}
-    const pad=30,viewW=width-90,viewH=height-58,scale=Math.min(viewW/W,viewH/H),ox=pad+(viewW-W*scale)/2,oy=24+(viewH-H*scale)/2;
-    // The accumulated front projection stays visible behind the active clipping cut.
-    ctx.save();ctx.globalAlpha=.055;ctx.globalCompositeOperation="lighter";
-    for(const slice of slices)ctx.drawImage(slice.image,ox,oy,W*scale,H*scale);
-    ctx.restore();
-    const active=slices[clipIndex];
-    ctx.save();ctx.globalAlpha=.2;ctx.drawImage(active.image,ox,oy,W*scale,H*scale);ctx.restore();
-    ctx.fillStyle="rgba(222,232,233,.72)";
-    for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(active.field[y*W+x]>=.32)ctx.fillRect(ox+x*scale,oy+y*scale,scale+.35,scale+.35);
-    ctx.save();ctx.setTransform(scale,0,0,scale,ox,oy);ctx.strokeStyle="#e4eeee";ctx.lineWidth=.28;contours(ctx,active.field);ctx.strokeStyle="#ff6b52";ctx.lineWidth=.34;drawVoidPerimeters(ctx,active.field);ctx.restore();
-    ctx.strokeStyle="#8bd9cf";ctx.lineWidth=1.25;ctx.strokeRect(ox+.5,oy+.5,W*scale,H*scale);
-    // Rhino-like side depth rail showing the clipping plane position through the loft.
-    const railX=width-37,railTop=31,railBottom=height-30,planeY=railTop+(railBottom-railTop)*clip/100;
-    ctx.fillStyle="rgba(10,16,18,.52)";ctx.fillRect(railX-10,railTop,20,railBottom-railTop);
-    ctx.strokeStyle="#718388";ctx.strokeRect(railX-10+.5,railTop+.5,19,railBottom-railTop-1);
-    ctx.fillStyle="#8fa1a5";for(let i=0;i<7;i++)ctx.fillRect(railX-4,railTop+i*(railBottom-railTop)/6,8,1);
-    ctx.shadowColor="#7cf0df";ctx.shadowBlur=9;ctx.strokeStyle="#8ff4e5";ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(railX-15,planeY);ctx.lineTo(railX+15,planeY);ctx.stroke();ctx.shadowBlur=0;
-    ctx.fillStyle="#dbe6e8";ctx.font="10px sans-serif";ctx.textAlign="left";ctx.fillText("FRONT",12,17);ctx.fillStyle="#91acae";ctx.fillText(`CUT ${clipIndex+1} / ${slices.length}`,12,height-12);
-  },[slices,clip,clipIndex]);
-  return <article className="clip-preview-node" style={{left:position.x,top:position.y}}>
-    <header onPointerDown={onDragStart}><div className="model-icon"><ScanLine size={18}/></div><div><h2>SubD Section Cut</h2><p>Front orthographic · section from smoothed massing</p></div><span>DRAG · CLIP</span></header>
-    <canvas ref={canvas} width={430} height={300} aria-label="Front orthographic view with movable clipping plane"/>
-    <div className="spatial-constraint-band compact"><strong>20′ × 20′</strong><span>{heightInches/12}′ high</span><span>1 floor</span><span>Trimmed</span></div>
-    <div className="clip-control"><label><span>Clipping plane</span><strong>{clip}%</strong><input type="range" min="0" max="100" step="1" value={clip} onChange={e=>setClip(Number(e.target.value))}/><small>Front section</small><small>Back section</small></label></div>
-    <p className="clip-note">The filled cut is sampled directly from the smoothed SubD field. Move the plane through the massing; orange lines retain its internal void boundaries.</p>
-    <span className="port port-left" aria-hidden="true"/>
-  </article>;
-}
-
-function ExportNode({slices,lineFidelity,primaryCount,offsetsPerPrimary,exportHeight,setExportHeight,position,onDragStart}:{slices:Slice[];lineFidelity:number;primaryCount:number;offsetsPerPrimary:number;exportHeight:number;setExportHeight:(value:number)=>void;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+function ExportNode({model,thickness,slices,lineFidelity,primaryCount,offsetsPerPrimary,exportHeight,setExportHeight,position,onDragStart}:{model:LoftModel;thickness:number;slices:Slice[];lineFidelity:number;primaryCount:number;offsetsPerPrimary:number;exportHeight:number;setExportHeight:(value:number)=>void;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
   const [version,setVersion]=useState<7|8>(8),[busy,setBusy]=useState(false);
-  const run=async()=>{setBusy(true);try{await exportRhinoBundle(slices,version,lineFidelity,exportHeight,primaryCount,offsetsPerPrimary)}finally{setBusy(false)}};
+  const run=async()=>{setBusy(true);try{await exportLoftBundle(model,thickness,version)}finally{setBusy(false)}};
   return <article className="export-node" style={{left:position.x,top:position.y}}>
     <header onPointerDown={onDragStart}><div className="model-icon"><Download size={19}/></div><div><h2>Rhino Export</h2><p>One coordinated file · three editable geometry layers</p></div><span>DRAG · 3DM</span></header>
     <div className="rhino-version"><span>File version</span><div role="group" aria-label="Rhino file version"><button className={version===7?"active":""} onClick={()=>setVersion(7)}>Rhino 7</button><button className={version===8?"active":""} onClick={()=>setVersion(8)}>Rhino 8</button></div><small>Imperial model units: inches · layout units: feet.</small></div>
     <div className="export-scale"><div><span>Maximum footprint</span><strong>20′ × 20′</strong><small>240″ × 240″ architectural envelope</small></div><label><span>Overall height</span><strong>{exportHeight/12}′ <small>({exportHeight}″)</small></strong><input type="range" min="96" max="240" step="12" value={exportHeight} onChange={event=>setExportHeight(Number(event.target.value))}/><small>8′</small><small>20′</small></label></div>
     <div className="export-options export-bundle">
-      <section><Box size={22}/><div><strong>01 · Unified Printable Form</strong><p>One single-floor watertight mesh inside the 20′ × 20′ envelope, organized by {primaryCount} primary lines and {offsetsPerPrimary} offsets per primary.</p></div></section>
-      <section><ScanLine size={22}/><div><strong>02 · Section Surfaces</strong><p>Every CT section remains an independent named surface on its own Rhino layer.</p></div></section>
-      <section><ScanLine size={22}/><div><strong>03 · Boundary Lines</strong><p>Editable exterior and void curves exported at {lineFidelity}% fidelity.</p></div></section>
+      <section><Box size={22}/><div><strong>01 · Unified Printable Form</strong><p>The displayed circulation loft, with {thickness}″ membrane thickness. A positive thickness closes its perimeter.</p></div></section>
+      <section><ScanLine size={22}/><div><strong>02 · Section Surfaces</strong><p>The same loft membrane exported as an unthickened surface mesh on a separate layer.</p></div></section>
+      <section><ScanLine size={22}/><div><strong>03 · Boundary Lines</strong><p>Editable loft section curves, perimeter curves, and primary circulation rails.</p></div></section>
     </div>
-    <div className="export-secondary export-all"><span>{slices.length} sections · one floor · max 20′ × 20′ × {exportHeight/12}′ · outside geometry trimmed</span><button onClick={()=>void run()} disabled={!slices.length||busy}><Download size={14}/>{busy?"Building complete package…":`Export all 3 · R${version}`}</button></div>
+    <div className="export-secondary export-all"><span>{slices.length} sections · one floor · max 20′ × 20′ × {exportHeight/12}′ · outside geometry trimmed</span><button onClick={()=>void run()} disabled={model.rows.length<2||busy}><Download size={14}/>{busy?"Building complete package…":`Export all 3 · R${version}`}</button></div>
     <span className="port port-left port-mesh-in" aria-hidden="true"/><span className="port port-right port-preview-out" aria-hidden="true"/>
   </article>;
+}
+
+const SPACE_CRITERIA=["curvature","collision","deflation","centrality","rhythm","scale"] as const;
+type SpaceCriterion=typeof SPACE_CRITERIA[number];
+type SpaceKind="lobby"|"office"|"gathering";
+const SPACE_TYPES=[{id:"lobby",title:"Lobby",number:"01"},{id:"office",title:"Workspaces/Office Spaces",number:"02"},{id:"gathering",title:"Gathering Spaces",number:"03"}] as const;
+const SPACE_COLORS:Record<SpaceKind,string>={lobby:"#d924e8",office:"#1ec1f2",gathering:"#ff268c"};
+const SPACE_PRESETS:Record<SpaceKind,{name:string;ratings:number[]}[]>={
+ lobby:[{name:"Topographic / Ground-field",ratings:[7,2,6,2,2,3]},{name:"Compressed Sequential",ratings:[4,6,9,2,8,6]},{name:"Vertical Void",ratings:[1,7,5,9,3,5]},{name:"Continuous Hall",ratings:[1,2,8,2,1,7]},{name:"Linear Gallery",ratings:[3,6,5,2,2,3]}],
+ office:[{name:"Cascaded / Terrace Plates",ratings:[4,4,2,1,6,5]},{name:"Open Hall",ratings:[1,2,6,2,1,7]},{name:"Flat Deep-plate",ratings:[1,2,2,1,1,2]},{name:"Void-edge",ratings:[1,7,5,9,3,5]},{name:"Folded / Undulating",ratings:[8,7,9,3,8,7]}],
+ gathering:[{name:"Stepped Amphitheatre",ratings:[5,3,3,7,3,4]},{name:"Void-field",ratings:[9,6,5,8,2,2]},{name:"Inserted Horizontal Plate",ratings:[7,8,8,4,5,6]},{name:"Contained Room Within Volume",ratings:[9,9,5,2,3,5]},{name:"Linear Edge Gallery",ratings:[7,7,5,2,2,3]}]
+};
+const presetValues=(space:SpaceKind,index:number)=>Object.fromEntries(SPACE_CRITERIA.map((criterion,i)=>[criterion,SPACE_PRESETS[space][index].ratings[i]])) as Record<SpaceCriterion,number>;
+function SpaceQualitiesNode({presetIndex,onPreset,activeSpace,onSpaceChange,title,number,images,active,onActivate,values,onValue,model,position,onDragStart}:{presetIndex:number;onPreset:(index:number)=>void;activeSpace:SpaceKind;onSpaceChange:(space:SpaceKind)=>void;title:string;number:string;images:StoredImage[];active:boolean;onActivate:()=>void;values:Record<SpaceCriterion,number>;onValue:(criterion:SpaceCriterion,value:number,base?:Record<SpaceCriterion,number>)=>void;model:LoftModel|null;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+  const measured=useMemo(()=>model?analyzeLoft(model):null,[model]);
+  const matches=useMemo(()=>measured?rankTypologies(measured,SPACE_PRESETS[activeSpace]):[],[measured,activeSpace]);
+  const recommendations=useMemo(()=>measured?recommendSpace(measured,SPACE_PRESETS):[],[measured]);
+  const recommended=recommendations[0],intent=psychologicalIntent[activeSpace],categoryResult=recommendations.find(result=>result.category===activeSpace);
+  const [autoScores,setAutoScores]=useState(true);
+  const displayed=autoScores&&measured?measured:values;
+  return <article className={`spatial-rational-node space-qualities-node ${active?"space-active":""}`} style={{left:position.x,top:position.y,"--space-color":SPACE_COLORS[activeSpace]} as React.CSSProperties} onClick={onActivate} aria-label={`${title} spatial qualities`}>
+    <span className="space-input-port" aria-hidden="true"/>
+    <header onPointerDown={onDragStart}><div className="model-icon">{number}</div><div><h2>Spatial Qualities</h2><p>Circulation loft → {title}</p></div><span>DRAG</span></header>
+    <div className="loft-render-toolbar space-tabs" role="tablist" aria-label="Space type">{SPACE_TYPES.map(space=><button key={space.id} id={`space-tab-${space.id}`} role="tab" aria-selected={activeSpace===space.id} aria-controls="space-qualities-panel" aria-pressed={activeSpace===space.id} style={{"--tab-color":SPACE_COLORS[space.id]} as React.CSSProperties} onClick={()=>onSpaceChange(space.id)} onKeyDown={event=>{if(!["ArrowLeft","ArrowRight","Home","End"].includes(event.key))return;event.preventDefault();const index=SPACE_TYPES.findIndex(space=>space.id===activeSpace),next=event.key==="Home"?0:event.key==="End"?2:(index+(event.key==="ArrowRight"?1:2))%3;onSpaceChange(SPACE_TYPES[next].id);document.getElementById(`space-tab-${SPACE_TYPES[next].id}`)?.focus()}}>{space.title}</button>)}</div>
+    <div id="space-qualities-panel" role="tabpanel" aria-labelledby={`space-tab-${activeSpace}`}>
+    <button className="space-route-button" aria-pressed={active} onClick={onActivate}>{active?"Active · receiving circulation loft":"Select as active destination"}</button>
+    <div className="space-source-images">{Array.from({length:3},(_,i)=>images[i]?<figure key={images[i].key}><img src={source(images[i].key)} alt={images[i].name}/><figcaption title={images[i].name}>{images[i].name}</figcaption></figure>:<div className="space-source-placeholder" key={i}>Source image {i+1}<small>Select images in CT Volume</small></div>)}</div>
+    {images.length>3&&<p className="space-source-note">First three selected source images · {images.length} images in the loft sequence</p>}
+    <section className="space-recommendation" aria-live="polite"><span>Recommended use · psychological design intent</span>{recommended?<><h3>{SPACE_TYPES.find(space=>space.id===recommended.category)!.title}</h3><p>{recommended.typology} · {recommended.fit}% heuristic fit · {recommended.fit<65||recommended.fit-recommendations[1].fit<5?"Tentative recommendation":"Leading recommendation"}</p><button onClick={()=>onSpaceChange(recommended.category)}>View recommended space</button><table><thead><tr><th>Space</th><th>Reference fit</th><th>Design intent</th><th>Combined</th></tr></thead><tbody>{recommendations.map(result=><tr key={result.category}><td>{SPACE_TYPES.find(space=>space.id===result.category)!.title}</td><td>{result.referenceFit}%</td><td>{result.intentFit}%</td><td>{result.fit}%</td></tr>)}</tbody></table></>:<p>Generate a loft to compare lobby, workspace, and gathering suitability.</p>}
+    <h4>How this space is intended to feel</h4><ul>{intent.goals.map(goal=><li key={goal}>{goal}</li>)}</ul>
+    {categoryResult&&<><h4>Geometry signals · {title}</h4>{categoryResult.checks.map(check=><p key={check.name}><strong>{check.name}: {Math.round(check.value*100)}%</strong><br/>{check.reason}</p>)}</>}
+    <details><summary>Potential concerns and missing context</summary><ul>{intent.risks.map(risk=><li key={risk}>{risk}</li>)}</ul><p>Not established by this loft:</p><ul>{intent.context.map(item=><li key={item}>{item}</li>)}</ul></details>
+    <p className="psy-method">Based on your psychology slides. Combined fit uses 60% reference descriptor similarity and 40% geometric design-intent proxies, with equal weight within each group. These are design suggestions, not predictions of how a person will feel. Daylight, privacy, and neighboring spaces are unmeasured and do not contribute to the score.</p><a href={`/space-references/${activeSpace}-psychology.png`} target="_blank" rel="noreferrer">View psychology reference</a></section>
+    <section className="space-classification" aria-live="polite"><span>Geometry classification · {title}</span>{matches.length?<><h3>{matches[0].name}</h3><p>{matches[0].similarity}% descriptor similarity · {matches[0].similarity<65||matches[1].distance-matches[0].distance<.5?"Tentative match":"Closest reference match"}</p><table><thead><tr><th>Descriptor</th><th>Loft</th><th>Reference</th></tr></thead><tbody>{SPACE_CRITERIA.map((key,i)=><tr key={key}><td>{key}</td><td>{measured![key]}</td><td>{matches[0].ratings[i]}</td></tr>)}</tbody></table><h4>Closest alternatives</h4>{matches.slice(1,3).map(match=><p key={match.name}>{match.name} · {match.similarity}% descriptor similarity</p>)}<details><summary>All matches and measurement logic</summary>{matches.slice(3).map(match=><p key={match.name}>{match.name} · {match.similarity}%</p>)}<p>Curvature: accumulated profile and rail bending. Collision: proximity between primary rails. Deflation: vertical compression within the envelope. Centrality: rail concentration around the plan center. Rhythm: repeated rails and consistent profile widths. Scale: occupied geometric extent. Measurements use the loft’s dimensions for proximity and vertical compression. Matching compares absolute ratings and the relative descriptor pattern, giving curvature, convergence, centrality, and rhythm more influence than generic size. No random labels are assigned. This is a diagrammatic estimate, not a test of occupancy or structural performance.</p></details></>:<p>Select source images and generate a circulation loft to assign a typology.</p>}</section>
+    <div className="space-preset"><label>Reference space type<select value={presetIndex} onChange={event=>{setAutoScores(false);onPreset(Number(event.target.value))}}>{SPACE_PRESETS[activeSpace].map((preset,i)=><option key={preset.name} value={i}>{preset.name}</option>)}</select></label><button onClick={()=>{setAutoScores(false);onPreset(presetIndex)}}>Restore reference ratings</button><a href={`/space-references/${activeSpace}.png`} target="_blank" rel="noreferrer">View reference sheet</a><p>Choosing a type loads its six reference ratings. Adjust the sliders to customize this space.</p></div>
+    <div className="loft-render-toolbar"><button aria-pressed={autoScores} onClick={()=>setAutoScores(true)}>Live extracted scores</button><span>{autoScores?"Scores follow loft geometry":"Manual comparison · classification still uses the loft"}</span></div>
+    <div className="space-criteria">{SPACE_CRITERIA.map(criterion=><label key={criterion}><span>{criterion}</span><output>{displayed[criterion]} / 10</output><input aria-label={`${title} ${criterion}`} type="range" min="1" max="10" step=".1" value={displayed[criterion]} onChange={event=>{setAutoScores(false);onValue(criterion,Number(event.target.value),displayed)}}/><small>1</small><small>10</small></label>)}</div>
+    <p className="space-source-note" aria-live="polite">{active?(model?.rows.length?`Live loft connected · ${model.rows.length} transverse profiles · ${model.rails.length} primary rails`:"Active destination · select source images to generate the loft"):"Inactive destination · click this component to connect the live loft"}. Criteria are independent ratings for this space.</p>
+    </div>
+  </article>;
+}
+
+function IllustratorExportNode({images,model,space,capture,position,onDragStart}:{images:StoredImage[];model:LoftModel;space:SpaceKind;capture:()=>string;position:{x:number;y:number};onDragStart:(event:React.PointerEvent)=>void}){
+ const scores=useMemo(()=>analyzeLoft(model),[model]),match=useMemo(()=>scores?rankTypologies(scores,SPACE_PRESETS[space])[0]:null,[scores,space]);
+ const [preview,setPreview]=useState<string|null>(null),[error,setError]=useState(""),[busy,setBusy]=useState(false);
+ const [classificationMode,setClassificationMode]=useState<"automatic"|"manual">("automatic");
+ const [manualLabels,setManualLabels]=useState<Record<SpaceKind,string>>({lobby:SPACE_PRESETS.lobby[0].name,office:SPACE_PRESETS.office[0].name,gathering:SPACE_PRESETS.gathering[0].name});
+ const exportLabel=classificationMode==="automatic"?(match?.name||""):manualLabels[space].trim();
+ useEffect(()=>{setPreview(null)},[model,space,classificationMode,exportLabel]);
+ useEffect(()=>()=>{if(preview)URL.revokeObjectURL(preview)},[preview]);
+ const make=async()=>{if(!scores||!exportLabel)return null;const clay=capture();const sourceImages=await Promise.all(images.slice(0,3).map(async image=>{const response=await fetch(source(image.key));if(!response.ok)throw new Error("Could not load a source image.");const blob=await response.blob();const data=await new Promise<string>((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result));reader.onerror=()=>reject(new Error("Could not embed a source image."));reader.readAsDataURL(blob)});return {data,name:image.name}}));return illustratorSheet(clay,exportLabel,SPACE_TYPES.find(s=>s.id===space)!.title,scores,SPACE_COLORS[space],sourceImages)};
+ const run=async(download:boolean)=>{setBusy(true);setError("");try{const svg=await make();if(!svg)return;const url=URL.createObjectURL(new Blob([svg],{type:"image/svg+xml"}));if(download){const a=document.createElement("a");a.href=url;a.download=`sand-scan-${space}-typology.svg`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}else setPreview(url)}catch(e){setError(e instanceof Error?e.message:"Could not export the sheet.")}finally{setBusy(false)}};
+ return <article className="spatial-rational-node illustrator-export-node" style={{left:position.x,top:position.y}}><header onPointerDown={onDragStart}><div className="model-icon"><Download size={20}/></div><div><h2>Illustrator Export</h2><p>Current clay view · assigned typology · descriptors</p></div><span>DRAG · SVG</span></header><div className="illustrator-content"><p>{SPACE_TYPES.find(s=>s.id===space)!.title} · {exportLabel||"Enter a classification"}</p><fieldset className="classification-export-controls"><legend>Geometric classification</legend><div className="loft-render-toolbar" role="group" aria-label="Classification source"><button aria-pressed={classificationMode==="automatic"} onClick={()=>setClassificationMode("automatic")}>Automatic match</button><button aria-pressed={classificationMode==="manual"} onClick={()=>{if(classificationMode!=="manual"&&match)setManualLabels(previous=>({...previous,[space]:match.name}));setClassificationMode("manual")}}>Choose manually</button></div>{classificationMode==="manual"&&<><label>Reference typology<select value={SPACE_PRESETS[space].some(p=>p.name===manualLabels[space])?manualLabels[space]:"custom"} onChange={event=>setManualLabels(previous=>({...previous,[space]:event.target.value==="custom"?"":event.target.value}))}>{SPACE_PRESETS[space].map(preset=><option key={preset.name} value={preset.name}>{preset.name}</option>)}<option value="custom">Custom classification</option></select></label><label>Exported classification<input type="text" maxLength={100} value={manualLabels[space]} onChange={event=>setManualLabels(previous=>({...previous,[space]:event.target.value}))} placeholder="Enter your typology label"/></label><p>Your label is used in the preview and Illustrator export. Geometry descriptor ratings remain measured from the loft.</p></>}<p>Automatic suggestion: {match?.name||"Generate a loft first"}</p></fieldset><p>Matches the reference layout: clay above, typology below, then three source images and six gradient rated bars. Exports the current camera, zoom, pan, thickness, and clipping view in clay.</p><div className="loft-render-toolbar"><button disabled={!scores||!exportLabel||busy} onClick={()=>run(false)}>Preview current sheet</button><button disabled={!scores||!exportLabel||busy} onClick={()=>run(true)}>Export for Illustrator</button></div>{error&&<p role="alert">{error}</p>}{preview&&<img className="illustrator-sheet-preview" src={preview} alt="Clay view, assigned typology and six measured descriptor bars"/>}<p>Illustrator-compatible SVG. Text and bars are editable vectors; the clay view is an embedded image. Open in Illustrator and save as .ai. Pause 360° rotation to choose a specific angle.</p></div><span className="port port-left" aria-hidden="true"/></article>;
 }
 
 export default function PhotoModel({images,position,onDragStart}:{images:StoredImage[];position:{x:number;y:number};onDragStart:(e:React.PointerEvent)=>void}){
@@ -1050,11 +1019,19 @@ export default function PhotoModel({images,position,onDragStart}:{images:StoredI
   const [fields,setFields]=useState<Float32Array[]>([]),[busy,setBusy]=useState(true);
   const [interval,setInterval]=useState(.68),[elongation,setElongation]=useState(165),[continuity,setContinuity]=useState(72),[scan,setScan]=useState(50),[density,setDensity]=useState(42),[depthGain,setDepthGain]=useState(68),[voidTransform,setVoidTransform]=useState(0);
   const [angle,setAngle]=useState(.62),[tilt,setTilt]=useState(.3),[lineFidelity,setLineFidelity]=useState(76),[primaryLineCount,setPrimaryLineCount]=useState(5),[offsetsPerPrimary,setOffsetsPerPrimary]=useState(2),[bifurcationsPerPrimary,setBifurcationsPerPrimary]=useState(3),[bifurcationDistance,setBifurcationDistance]=useState(65),[bifurcationScale,setBifurcationScale]=useState(60),[primarySmoothing,setPrimarySmoothing]=useState(72),[gridSize,setGridSize]=useState(8),[gridAlignment,setGridAlignment]=useState(64),[exportHeight,setExportHeight]=useState(144);
-  const [circulationSettings,setCirculationSettings]=useState<CirculationSettings>({primaryCount:2,pathWidth:5.5,activeBranches:2,junctionWidth:55,smoothing:70}),[floorPlateSettings,setFloorPlateSettings]=useState<FloorPlateSettings>({noiseReduction:72,plateThickness:10,surfaceFlow:82});
+  const [circulationSettings,setCirculationSettings]=useState<CirculationSettings>({primaryCount:2,pathWidth:5.5,activeBranches:2,junctionWidth:55,smoothing:70});
   const [realitySettings,setRealitySettings]=useState<RealitySettings>({supportSpacing:24,clearance:6,maxSlope:12});
   const canvas=useRef<HTMLCanvasElement>(null),orbit=useRef<{x:number;y:number;a:number;t:number}|null>(null);
-  type ChildNode="reality"|"preview"|"clip"|"export"|"boundary"|"grid"|"circulation"|"framework"|"floor"|"mesh";
-  const [nodePositions,setNodePositions]=useState<Record<ChildNode,{x:number;y:number}>>(()=>({grid:{x:position.x+760,y:position.y},boundary:{x:position.x+1520,y:position.y},circulation:{x:position.x+2280,y:position.y},framework:{x:position.x+3060,y:position.y},floor:{x:position.x+3820,y:position.y},mesh:{x:position.x+4660,y:position.y},export:{x:position.x+5500,y:position.y},preview:{x:position.x+6500,y:position.y},clip:{x:position.x+7080,y:position.y},reality:{x:position.x+760,y:position.y+900}}));
+  const captureClay=useRef<(()=>string)|null>(null);
+  const [loftThickness,setLoftThickness]=useState(3);
+  const [loftMembrane,setLoftMembrane]=useState<LoftModel>({rows:[],rails:[]});
+  const [renderHeight,setRenderHeight]=useState(1070);
+  const [activeSpace,setActiveSpace]=useState<SpaceKind>("lobby");
+  const [spaceValues,setSpaceValues]=useState<Record<SpaceKind,Record<SpaceCriterion,number>>>(()=>Object.fromEntries(SPACE_TYPES.map(space=>[space.id,presetValues(space.id,0)])) as Record<SpaceKind,Record<SpaceCriterion,number>>);
+  const [spacePresets,setSpacePresets]=useState<Record<SpaceKind,number>>({lobby:0,office:0,gathering:0});
+  const loftSourceImages=selected.map(key=>images.find(image=>image.key===key)).filter((image):image is StoredImage=>Boolean(image));
+  type ChildNode="reality"|"export"|"boundary"|"grid"|"circulation"|"loft"|"loftRender"|"spaces"|"illustrator";
+  const [nodePositions,setNodePositions]=useState<Record<ChildNode,{x:number;y:number}>>(()=>({grid:{x:position.x+760,y:position.y},boundary:{x:position.x+1520,y:position.y},circulation:{x:position.x+2280,y:position.y},loft:{x:position.x+3060,y:position.y},loftRender:{x:position.x+3820,y:position.y},export:{x:position.x+4580,y:position.y},spaces:{x:position.x+3820,y:position.y+1200},illustrator:{x:position.x+4580,y:position.y+850},reality:{x:position.x+760,y:position.y+900}}));
   const nodeDrag=useRef<{node:ChildNode;startX:number;startY:number;origin:{x:number;y:number}}|null>(null);
   useEffect(()=>{
     const move=(event:PointerEvent)=>{const active=nodeDrag.current;if(!active)return;setNodePositions(current=>({...current,[active.node]:{x:Math.max(12,active.origin.x+event.clientX-active.startX),y:Math.max(20,active.origin.y+event.clientY-active.startY)}}))};
@@ -1093,59 +1070,54 @@ export default function PhotoModel({images,position,onDragStart}:{images:StoredI
       ctx.save();ctx.setTransform((px.x-p.x)/W,(px.y-p.y)/W,(py.x-p.x)/H,(py.y-p.y)/H,p.x,p.y);
       ctx.globalAlpha=i===scanIndex?.98:density/100*.43;ctx.imageSmoothingEnabled=true;ctx.drawImage(slice.image,0,0);
       ctx.globalAlpha=i===scanIndex?.95:.14;ctx.strokeStyle=i===scanIndex?"#bde5dc":"#b6c9c9";ctx.lineWidth=i===scanIndex?.22:.11;contours(ctx,slice.field);
-      if(i===scanIndex){ctx.globalAlpha=1;ctx.strokeStyle="#ff6b52";ctx.lineWidth=.18;drawVoidPerimeters(ctx,slice.field)}
-      if(i===scanIndex){ctx.strokeStyle="#81d9cd";ctx.lineWidth=.14;ctx.strokeRect(0,0,W,H)}ctx.restore();
+      if(i===scanIndex){ctx.globalAlpha=1;ctx.strokeStyle=VIEWPORT_TERTIARY;ctx.lineWidth=.18;drawVoidPerimeters(ctx,slice.field)}
+      if(i===scanIndex){ctx.strokeStyle=VIEWPORT_SECONDARY;ctx.lineWidth=.14;ctx.strokeRect(0,0,W,H)}ctx.restore();
     }
     const active=slices[scanIndex],bx=535,by=85,bw=165,bh=165*H/W;
     ctx.fillStyle="#10191c";ctx.fillRect(520,48,190,240);ctx.strokeStyle="#55747a";ctx.lineWidth=1;ctx.strokeRect(520.5,48.5,189,239);
     ctx.fillStyle="#9fc6c7";ctx.font="12px sans-serif";ctx.textAlign="left";ctx.fillText("ACTIVE SECTION",bx,72);
-    ctx.globalAlpha=1;ctx.drawImage(active.image,bx,by,bw,bh);ctx.save();ctx.setTransform(bw/W,0,0,bh/H,bx,by);ctx.strokeStyle="#ff6b52";ctx.lineWidth=.22;drawVoidPerimeters(ctx,active.field);ctx.restore();ctx.strokeStyle="#8cd5cb";ctx.strokeRect(bx+.5,by+.5,bw,bh);
+    ctx.globalAlpha=1;ctx.drawImage(active.image,bx,by,bw,bh);ctx.save();ctx.setTransform(bw/W,0,0,bh/H,bx,by);ctx.strokeStyle=VIEWPORT_TERTIARY;ctx.lineWidth=.22;drawVoidPerimeters(ctx,active.field);ctx.restore();ctx.strokeStyle=VIEWPORT_SECONDARY;ctx.strokeRect(bx+.5,by+.5,bw,bh);
     ctx.strokeStyle="#659494";ctx.beginPath();ctx.moveTo(bx+bw/2,by);ctx.lineTo(bx+bw/2,by+bh);ctx.moveTo(bx,by+bh/2);ctx.lineTo(bx+bw,by+bh/2);ctx.stroke();
     ctx.fillStyle="#a7bec0";ctx.font="12px sans-serif";ctx.fillText(`${scan}% THROUGH VOLUME`,bx,by+bh+23);
   },[slices,scanIndex,scan,density,angle,tilt,busy]);
   const toggle=(key:string)=>setSelected(current=>current.includes(key)?current.filter(item=>item!==key):[...current,key]);
   const deselectSelection=()=>setSelected([]);
   const realityPosition=nodePositions.reality;
-  const previewPosition=nodePositions.preview;
-  const clipPosition=nodePositions.clip;
   const exportPosition=nodePositions.export;
   const boundaryPosition=nodePositions.boundary;
   const gridPosition=nodePositions.grid;
   const circulationPosition=nodePositions.circulation;
-  const frameworkPosition=nodePositions.framework;
-  const floorPosition=nodePositions.floor;
-  const meshPosition=nodePositions.mesh;
+  const loftPosition=nodePositions.loft;
+  const loftRenderPosition=nodePositions.loftRender;
   const horizontalWire=(start:{x:number;y:number},end:{x:number;y:number})=>`M ${start.x} ${start.y} C ${start.x+(end.x-start.x)*.48} ${start.y}, ${end.x-(end.x-start.x)*.48} ${end.y}, ${end.x} ${end.y}`;
   const verticalWire=(start:{x:number;y:number},end:{x:number;y:number})=>`M ${start.x} ${start.y} C ${start.x} ${start.y+(end.y-start.y)*.48}, ${end.x} ${end.y-(end.y-start.y)*.48}, ${end.x} ${end.y}`;
   return <>
     <svg className="workflow-wires" aria-hidden="true">
+      <path d={horizontalWire({x:loftRenderPosition.x+700,y:loftRenderPosition.y+500},{x:nodePositions.illustrator.x,y:nodePositions.illustrator.y+286})}/>
+      <path style={{stroke:SPACE_COLORS[activeSpace]}} className="space-connection space-connection-active" d={verticalWire({x:loftRenderPosition.x+350,y:loftRenderPosition.y+renderHeight},{x:nodePositions.spaces.x+350,y:nodePositions.spaces.y})}/>
+      <path d={horizontalWire({x:loftRenderPosition.x+700,y:loftRenderPosition.y+286},{x:exportPosition.x,y:exportPosition.y+286})}/>
       <path d={horizontalWire({x:position.x+620,y:position.y+286},{x:gridPosition.x,y:gridPosition.y+286})}/>
       <path d={horizontalWire({x:gridPosition.x+620,y:gridPosition.y+286},{x:boundaryPosition.x,y:boundaryPosition.y+286})}/>
       <path d={horizontalWire({x:boundaryPosition.x+620,y:boundaryPosition.y+286},{x:circulationPosition.x,y:circulationPosition.y+286})}/>
-      <path d={horizontalWire({x:circulationPosition.x+700,y:circulationPosition.y+286},{x:frameworkPosition.x,y:frameworkPosition.y+286})}/>
-      <path d={horizontalWire({x:frameworkPosition.x+700,y:frameworkPosition.y+286},{x:floorPosition.x,y:floorPosition.y+286})}/>
-      <path d={horizontalWire({x:floorPosition.x+760,y:floorPosition.y+286},{x:meshPosition.x,y:meshPosition.y+286})}/>
-      <path d={horizontalWire({x:meshPosition.x+760,y:meshPosition.y+286},{x:exportPosition.x,y:exportPosition.y+286})}/>
-      <path d={horizontalWire({x:exportPosition.x+980,y:exportPosition.y+286},{x:previewPosition.x,y:previewPosition.y+287})}/>
-      <path d={horizontalWire({x:previewPosition.x+500,y:previewPosition.y+287},{x:clipPosition.x,y:clipPosition.y+285})}/>
+      <path d={horizontalWire({x:circulationPosition.x+700,y:circulationPosition.y+286},{x:loftPosition.x,y:loftPosition.y+286})}/>
+      <path d={horizontalWire({x:loftPosition.x+700,y:loftPosition.y+286},{x:loftRenderPosition.x,y:loftRenderPosition.y+286})}/>
     </svg>
     <article className="model-node ct-node" data-node="model" style={{left:position.x,top:position.y}}>
     <header onPointerDown={onDragStart}><div className="model-icon"><ScanLine size={21}/></div><div><h2>Depth Maps → CT Volume</h2><p>Cubic depth blending · continuous massing</p></div><span>DRAG</span></header>
     <div className="model-stage"><canvas ref={canvas} width={720} height={380} aria-label="Rotatable CT style volume with highlighted scan section" onPointerDown={e=>{e.currentTarget.setPointerCapture(e.pointerId);orbit.current={x:e.clientX,y:e.clientY,a:angle,t:tilt}}} onPointerMove={e=>{const start=orbit.current;if(start){setAngle(start.a+(e.clientX-start.x)*.009);setTilt(Math.max(-1.2,Math.min(1.2,start.t+(e.clientY-start.y)*.006)))}}} onPointerUp={()=>{orbit.current=null}}/><span>Drag to orbit</span></div>
     <div className="ct-controls"><label>Scan position <strong>{scan}%</strong><input type="range" min="0" max="100" value={scan} onChange={e=>setScan(Number(e.target.value))}/></label><label>Volume density <strong>{density}%</strong><input type="range" min="10" max="100" value={density} onChange={e=>setDensity(Number(e.target.value))}/></label><label className="depth-gain">Depth separation <strong>{depthGain}%</strong><input type="range" min="10" max="100" value={depthGain} onChange={e=>setDepthGain(Number(e.target.value))}/></label><label className="massing-shape">Massing elongation <strong>{elongation}%</strong><input type="range" min="75" max="350" step="5" value={elongation} onChange={e=>setElongation(Number(e.target.value))}/><span className="range-ends"><i>Compact</i><i>Elongated</i></span></label><label className="massing-shape">Surface continuity <strong>{continuity}%</strong><input type="range" min="0" max="100" step="2" value={continuity} onChange={e=>setContinuity(Number(e.target.value))}/><span className="range-ends"><i>Sectional</i><i>Smooth + curved</i></span></label><label className="void-transform">Void / open-area transform <strong>{voidTransform===0?"Unchanged":voidTransform>0?`Expand +${voidTransform}%`:`Compress ${Math.abs(voidTransform)}%`}</strong><input type="range" min="-100" max="100" step="5" value={voidTransform} onChange={e=>setVoidTransform(Number(e.target.value))}/><span className="range-ends"><i>Compress openings</i><i>Expand openings</i></span></label></div>
     <div className="model-controls"><label>Slice interval <input type="range" min=".4" max="1.2" step=".02" value={interval} onChange={e=>setInterval(Number(e.target.value))}/></label><span className="export-routed">Exports routed to the connected Rhino component</span></div>
-    <div className="model-sources"><div className="model-caption"><strong>Imported depth sequence</strong><div><span>{selected.length} of {images.length} slices</span><button className="reset-selection" onClick={deselectSelection} disabled={!selected.length} title="Deselect every image from the CT sequence"><XCircle size={13}/>Deselect selection</button></div></div><div className="model-thumbs">{images.map(image=><button key={image.key} className={selected.includes(image.key)?"active":""} onClick={()=>toggle(image.key)} aria-pressed={selected.includes(image.key)} title={image.name}><img src={source(image.key)} alt=""/><span>{image.name}</span></button>)}</div>{!images.length&&<div className="depth-empty">Import images in Image Storage to build the CT sequence.</div>}</div>
+    <div className="model-sources"><div className="model-caption"><strong>Imported depth sequence</strong><div><span>{selected.length} of {images.length} slices</span><button className="reset-selection" onClick={deselectSelection} disabled={!selected.length} title="Deselect every image from the CT sequence"><XCircle size={13}/>Deselect selection</button></div></div>{([{id:"existing",name:"Model Photos"},{id:"new",name:"Midjourney Photos"}] as const).map(folder=><div className="depth-folder" key={folder.id}><h3>{folder.name} <small>{images.filter(image=>(image.folder||"existing")===folder.id).length} photos</small></h3><div className="model-thumbs">{images.filter(image=>(image.folder||"existing")===folder.id).map(image=><button key={image.key} className={selected.includes(image.key)?"active":""} onClick={()=>toggle(image.key)} aria-pressed={selected.includes(image.key)} title={image.name}><img src={source(image.key)} alt=""/><span>{image.name}</span></button>)}</div>{!images.some(image=>(image.folder||"existing")===folder.id)&&<p className="depth-folder-empty">No photos yet. Add images to this folder in Image Storage.</p>}</div>)}{!images.length&&<div className="depth-empty">Import images in Image Storage to build the CT sequence.</div>}</div>
     <p className="model-note">Each photo is read as a depth map with perimeter-aware cavity detection. The CT result is sent horizontally to Grid Rationalization, establishing the ordered framework that the Unified Section Cage uses to generate primary, offset, and bifurcating lines.</p><span className="port port-left port-storage-in" aria-hidden="true"/><span className="port port-right port-grid-out" aria-hidden="true"/>
     </article>
     <RealityNode slices={groundedSlices} settings={realitySettings} setSettings={setRealitySettings} position={realityPosition} onDragStart={startChildDrag("reality")}/>
-    <ExportGeometryPreview slices={gridSlices} exportHeight={exportHeight} position={previewPosition} onDragStart={startChildDrag("preview")}/>
-    <FrontClipPreview slices={gridSlices} heightInches={exportHeight} position={clipPosition} onDragStart={startChildDrag("clip")}/>
     <GridRationalizationPreview slices={gridSlices} gridSize={gridSize} alignment={gridAlignment} setGridSize={setGridSize} setAlignment={setGridAlignment} position={gridPosition} onDragStart={startChildDrag("grid")}/>
     <ReadOnlyBoundaryLinesPreview slices={gridSlices} activeIndex={scanIndex} fidelity={lineFidelity} setFidelity={setLineFidelity} primaryCount={primaryLineCount} setPrimaryCount={setPrimaryLineCount} offsetsPerPrimary={offsetsPerPrimary} setOffsetsPerPrimary={setOffsetsPerPrimary} bifurcationsPerPrimary={bifurcationsPerPrimary} setBifurcationsPerPrimary={setBifurcationsPerPrimary} bifurcationDistance={bifurcationDistance} setBifurcationDistance={setBifurcationDistance} bifurcationScale={bifurcationScale} setBifurcationScale={setBifurcationScale} smoothing={primarySmoothing} setSmoothing={setPrimarySmoothing} position={boundaryPosition} onDragStart={startChildDrag("boundary")}/>
     <CirculationPreview slices={gridSlices} fidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} bifurcationsPerPrimary={bifurcationsPerPrimary} bifurcationDistance={bifurcationDistance} bifurcationScale={bifurcationScale} smoothing={primarySmoothing} settings={circulationSettings} setSettings={setCirculationSettings} heightInches={exportHeight} setHeightInches={setExportHeight} position={circulationPosition} onDragStart={startChildDrag("circulation")}/>
-    <CageCirculationPreview slices={gridSlices} fidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} bifurcationsPerPrimary={bifurcationsPerPrimary} bifurcationDistance={bifurcationDistance} bifurcationScale={bifurcationScale} smoothing={primarySmoothing} circulationSettings={circulationSettings} heightInches={exportHeight} position={frameworkPosition} onDragStart={startChildDrag("framework")}/>
-    <UnifiedFloorPlatePreview slices={gridSlices} fidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} bifurcationsPerPrimary={bifurcationsPerPrimary} bifurcationDistance={bifurcationDistance} bifurcationScale={bifurcationScale} smoothing={primarySmoothing} circulationSettings={circulationSettings} settings={floorPlateSettings} setSettings={setFloorPlateSettings} heightInches={exportHeight} position={floorPosition} onDragStart={startChildDrag("floor")}/>
-    <UnifiedRuledMeshPreview slices={gridSlices} fidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} bifurcationsPerPrimary={bifurcationsPerPrimary} bifurcationDistance={bifurcationDistance} bifurcationScale={bifurcationScale} smoothing={primarySmoothing} circulationSettings={circulationSettings} floorSettings={floorPlateSettings} heightInches={exportHeight} position={meshPosition} onDragStart={startChildDrag("mesh")}/>
-    <ExportNode slices={gridSlices} lineFidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} exportHeight={exportHeight} setExportHeight={setExportHeight} position={exportPosition} onDragStart={startChildDrag("export")}/>
+    <PrimaryCirculationLoftPreview slices={gridSlices} fidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} bifurcationsPerPrimary={bifurcationsPerPrimary} bifurcationDistance={bifurcationDistance} bifurcationScale={bifurcationScale} smoothing={primarySmoothing} circulationSettings={circulationSettings} heightInches={exportHeight} position={loftPosition} onDragStart={startChildDrag("loft")} onMembrane={setLoftMembrane}/>
+    <CirculationLoftRender onCapture={capture=>{captureClay.current=capture}} onHeight={setRenderHeight} model={loftMembrane} thickness={loftThickness} setThickness={setLoftThickness} position={loftRenderPosition} onDragStart={startChildDrag("loftRender")}/>
+    <IllustratorExportNode images={loftSourceImages} model={loftMembrane} space={activeSpace} capture={()=>{if(!captureClay.current)throw new Error("The render is not ready yet.");return captureClay.current()}} position={nodePositions.illustrator} onDragStart={startChildDrag("illustrator")}/>
+    <SpaceQualitiesNode presetIndex={spacePresets[activeSpace]} onPreset={index=>{setSpacePresets(current=>({...current,[activeSpace]:index}));setSpaceValues(current=>({...current,[activeSpace]:presetValues(activeSpace,index)}))}} activeSpace={activeSpace} onSpaceChange={setActiveSpace} title={SPACE_TYPES.find(space=>space.id===activeSpace)!.title} number={SPACE_TYPES.find(space=>space.id===activeSpace)!.number} images={loftSourceImages} active={true} onActivate={()=>{}} values={spaceValues[activeSpace]} onValue={(criterion,value,base)=>setSpaceValues(current=>({...current,[activeSpace]:{...(base||current[activeSpace]),[criterion]:value}}))} model={loftMembrane} position={nodePositions.spaces} onDragStart={startChildDrag("spaces")}/>
+    <ExportNode model={loftMembrane} thickness={loftThickness} slices={gridSlices} lineFidelity={lineFidelity} primaryCount={primaryLineCount} offsetsPerPrimary={offsetsPerPrimary} exportHeight={exportHeight} setExportHeight={setExportHeight} position={exportPosition} onDragStart={startChildDrag("export")}/>
   </>;
 }

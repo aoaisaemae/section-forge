@@ -5,11 +5,11 @@ import "./interactions.css";
 import "./typology.css";
 import "./descriptors.css";
 import "./primary-lines.css";
-import "./palette.css";
 import "./photo-model.css";
+import "./palette.css";
 
 export const metadata: Metadata = {
-  title: "Section Forge",
+  title: "Sand Scan",
   description: "A depth-map studio for constructing CT volumes and smoothed SubD massing.",
   icons: {
     icon: "/favicon.svg",
