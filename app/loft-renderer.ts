@@ -17,19 +17,23 @@ export function loftDisplayMesh(rows: V[][], thickness: number) {
     const along = sub(rows[Math.min(height-1,i+1)][j],rows[Math.max(0,i-1)][j]);
     return normalize(cross(along,sub(row[right],row[left])));
   }));
+  // Coincident samples share one extrusion direction so adjacent patches cannot split.
+  const key=(p:V)=>p.map(v=>v.toFixed(8)).join(',');
+  const shared=new Map<string,V>();
+  rows.forEach((row,i)=>row.forEach((p,j)=>{const k=key(p),n=shared.get(k)||[0,0,0];shared.set(k,n.map((v,d)=>v+ns[i][j][d]) as V);}));
+  rows.forEach((row,i)=>row.forEach((p,j)=>{ns[i][j]=normalize(shared.get(key(p))!);}));
+  const lower=rows.map((row,i)=>row.map((p,j)=>p.map((v,d)=>v-thickness*ns[i][j][d]) as V));
   const add = (p: V,n: V) => { positions.push(...p);normals.push(...n); };
-  const bottom = (p: V): V => [p[0],p[1]-thickness,p[2]];
   for(let i=0;i<height-1;i++)for(let j=0;j<width-1;j++){
     const ids=[[i,j],[i+1,j],[i+1,j+1],[i,j+1]];
     for(const k of [0,1,2,0,2,3]) { const [a,b]=ids[k];add(rows[a][b],ns[a][b]); }
-    if(thickness>0)for(const k of [0,2,1,0,3,2]) { const [a,b]=ids[k];add(bottom(rows[a][b]),ns[a][b].map(v=>-v) as V); }
+    if(thickness>0)for(const k of [0,2,1,0,3,2]) { const [a,b]=ids[k];add(lower[a][b],ns[a][b].map(v=>-v) as V); }
   }
   if(thickness>0){
-    const rim:V[]=[...rows[0],...rows.slice(1).map(row=>row[width-1]),...rows[height-1].slice(0,-1).reverse(),...rows.slice(1,-1).reverse().map(row=>row[0])];
-    rim.forEach((a,i)=>{
-      const b=rim[(i+1)%rim.length],previous=rim[(i+rim.length-1)%rim.length],next=rim[(i+2)%rim.length];
-      const na=normalize(cross(sub(b,previous),[0,-1,0])),nb=normalize(cross(sub(next,a),[0,-1,0]));
-      for(const [p,n] of [[a,na],[bottom(a),na],[bottom(b),nb],[a,na],[bottom(b),nb],[b,nb]] as [V,V][])add(p,n);
+    const rim:[number,number][]=[...rows[0].map((_,j)=>[0,j] as [number,number]),...rows.slice(1).map((_,i)=>[i+1,width-1] as [number,number]),...rows[height-1].slice(0,-1).map((_,j)=>[height-1,width-2-j] as [number,number]),...rows.slice(1,-1).map((_,i)=>[height-2-i,0] as [number,number])];
+    rim.forEach(([i,j],index)=>{
+      const [k,l]=rim[(index+1)%rim.length],a=rows[i][j],b=rows[k][l],c=lower[k][l],d=lower[i][j];
+      for(const triangle of [[a,d,c],[a,c,b]]){const n=normalize(cross(sub(triangle[1],triangle[0]),sub(triangle[2],triangle[0])));triangle.forEach(p=>add(p,n));}
     });
   }
   return {positions:new Float32Array(positions),normals:new Float32Array(normals)};
